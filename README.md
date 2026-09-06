@@ -51,13 +51,13 @@ bash init_setup.sh --mode custom
 
 ## 在线下载并保留交互菜单
 
-上传到 GitHub 后，将示例中的 `用户名/仓库名` 替换为实际地址。以下示例使用 `main` 分支；如果仓库默认分支不同，请一并替换。
+以下命令从本仓库的 `main` 分支下载脚本，可以直接复制使用。
 
 需要在线下载，同时保留交互菜单时，先下载到文件再执行：
 
 ```bash
 curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/用户名/仓库名/main/init_setup.sh \
+  https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh \
   -o /tmp/init_setup.sh && \
 bash /tmp/init_setup.sh
 ```
@@ -66,7 +66,7 @@ bash /tmp/init_setup.sh
 
 ```bash
 curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/用户名/仓库名/main/init_setup.sh \
+  https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh \
   | bash -s -- --yes --mode recommended
 ```
 

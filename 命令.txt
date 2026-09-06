@@ -1,2 +1,2 @@
-curl --fail --location --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/用户名/仓库名/main/init_setup.sh -o /tmp/init_setup.sh && bash /tmp/init_setup.sh
-curl --fail --location --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/用户名/仓库名/main/init_setup.sh | bash -s -- --yes --mode recommended
+curl --fail --location --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh -o /tmp/init_setup.sh && bash /tmp/init_setup.sh
+curl --fail --location --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh | bash -s -- --yes --mode recommended
