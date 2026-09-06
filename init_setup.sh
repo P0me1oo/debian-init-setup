@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.0.2"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -399,10 +399,10 @@ check_runtime_environment() {
 
 prepare_logfile() {
   local parent unsafe_parent
-  [[ "$LOGFILE" = /* ]] && [[ "$LOGFILE" != *$'\n'* ]] && [[ "$LOGFILE" != *$'\r'* ]] || {
+  if [[ "$LOGFILE" != /* || "$LOGFILE" == *$'\n'* || "$LOGFILE" == *$'\r'* ]]; then
     print_err "日志路径必须是不含换行的绝对路径：${LOGFILE}"
     return 1
-  }
+  fi
   parent="$(dirname "$LOGFILE")"
   if [ ! -d "$parent" ]; then
     install -d -m 0755 "$parent" || return 1
@@ -668,8 +668,12 @@ restore_latest_backup() {
     print_err "备份恢复未完全成功，请检查：${backup_dir}"
     return 1
   fi
-  command -v sysctl >/dev/null 2>&1 && sysctl --system >/dev/null 2>&1 || true
-  command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1 || true
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub >/dev/null 2>&1 || true
+  fi
   if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then reload_ssh_service >/dev/null 2>&1 || true; fi
   systemctl restart fail2ban >/dev/null 2>&1 || true
   systemctl restart systemd-journald >/dev/null 2>&1 || true
