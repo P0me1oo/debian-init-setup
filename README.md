@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.0.4`
+- 当前版本：`3.0.5`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -102,13 +102,13 @@ bash init_setup.sh --yes --mode full --replace-existing-runtime
 
 ## 自定义模式
 
-自定义模式默认关闭全部模块，交互时逐项开启：
+交互式自定义默认开启全部模块，提示 `[Y/n]`。直接回车保持开启，输入 `n` 关闭该项：
 
 ```bash
-bash init_setup.sh --mode custom
+bash init_setup.sh --interactive --mode custom
 ```
 
-无人值守自定义：
+无人值守运行示例（`custom` 默认全部关闭，再通过 `--enable` 指定模块）：
 
 ```bash
 bash init_setup.sh --yes --mode recommended --disable fail2ban,nexttrace-mtr
@@ -191,6 +191,13 @@ python -m unittest discover -s tests -v
 测试使用临时目录和模拟命令，不会修改当前机器的 SSH、防火墙或 Docker。真实服务、内核参数、软件源和重启后的状态仍需在 Debian 测试机上验证。
 
 ## 版本记录
+
+### 3.0.5
+
+- 自定义交互菜单默认开启全部模块，回车确认开启，输入 `n` 关闭；显式设置的环境变量和命令行开关仍按原有优先级生效。
+- 区分回车和输入中断，读取不到回答时停止执行。
+- 保留无人值守自定义模式从全部关闭开始的行为。
+- 增加回车默认值、单项关闭、显式覆盖和输入中断的回归测试。
 
 ### 3.0.4
 

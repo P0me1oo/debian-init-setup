@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.0.4"
+SCRIPT_VERSION="3.0.5"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -101,6 +101,7 @@ usage() {
 
 终端中直接运行会先选择运行模式；默认是推荐模式。
 非交互环境必须显式使用 --yes，避免把脚本通过管道执行时误改系统。
+自定义交互默认开启各模块：[Y/n] 回车开启，输入 n 关闭。
 
 模块名:
   update, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6, docker, all
@@ -243,6 +244,9 @@ apply_mode_defaults() {
       ENABLE_TIMEZONE=no
       ENABLE_DISABLE_IPV6=no
       ENABLE_DOCKER=no
+      if should_prompt; then
+        set_toggle_by_name yes all
+      fi
       ;;
     *) print_err "MODE 无效: $MODE。请使用 recommended/minimal/full/custom。"; exit 2 ;;
   esac
@@ -446,7 +450,10 @@ prompt_yes_no() {
   current="${!var_name}"
   if is_yes "$current"; then prompt="${label} [Y/n]: "; else prompt="${label} [y/N]: "; fi
   while true; do
-    if ! read -r -p "$prompt" answer; then answer=""; fi
+    if ! read -r -p "$prompt" answer; then
+      print_err "未读取到选择，已停止执行。"
+      return 1
+    fi
     answer="$(trim "$answer")"
     case "${answer,,}" in
       "") return 0 ;;
@@ -460,18 +467,18 @@ prompt_yes_no() {
 prompt_configuration() {
   should_prompt || return 0
   print_section "0) 运行配置"
-  print_info "直接回车保持当前值；输入 n 关闭该项。"
-  prompt_yes_no ENABLE_SYSTEM_UPDATE "执行系统更新/升级"
-  prompt_yes_no ENABLE_COMMON_TOOLS "安装常用工具"
-  prompt_yes_no ENABLE_NEXTTRACE_MTR "安装 NextTrace 和 mtr"
-  prompt_yes_no ENABLE_BBR "开启 BBR + fq"
-  prompt_yes_no ENABLE_SSH_BASELINE "配置 SSH 安全基线：端口 ${SSH_PORT}，root 密钥登录，禁用密码登录"
-  prompt_yes_no ENABLE_UFW "启用 UFW 防火墙，仅添加 SSH 放行"
-  prompt_yes_no ENABLE_FAIL2BAN "启用 Fail2ban"
-  prompt_yes_no ENABLE_JOURNAL_LIMIT "限制 systemd journal 最大占用为 ${JOURNAL_MAX_USE}"
-  prompt_yes_no ENABLE_TIMEZONE "设置系统时区为 ${TARGET_TIMEZONE}，并安装启用 chrony 做时间同步"
-  prompt_yes_no ENABLE_DISABLE_IPV6 "关闭 IPv6"
-  prompt_yes_no ENABLE_DOCKER "安装 Docker Engine 与 Docker Compose"
+  print_info "回车采用大写字母所示默认值：Y 开启，N 关闭；输入 n 可关闭该项。"
+  prompt_yes_no ENABLE_SYSTEM_UPDATE "执行系统更新/升级" || return 1
+  prompt_yes_no ENABLE_COMMON_TOOLS "安装常用工具" || return 1
+  prompt_yes_no ENABLE_NEXTTRACE_MTR "安装 NextTrace 和 mtr" || return 1
+  prompt_yes_no ENABLE_BBR "开启 BBR + fq" || return 1
+  prompt_yes_no ENABLE_SSH_BASELINE "配置 SSH 安全基线：端口 ${SSH_PORT}，root 密钥登录，禁用密码登录" || return 1
+  prompt_yes_no ENABLE_UFW "启用 UFW 防火墙，仅添加 SSH 放行" || return 1
+  prompt_yes_no ENABLE_FAIL2BAN "启用 Fail2ban" || return 1
+  prompt_yes_no ENABLE_JOURNAL_LIMIT "限制 systemd journal 最大占用为 ${JOURNAL_MAX_USE}" || return 1
+  prompt_yes_no ENABLE_TIMEZONE "设置系统时区为 ${TARGET_TIMEZONE}，并安装启用 chrony 做时间同步" || return 1
+  prompt_yes_no ENABLE_DISABLE_IPV6 "关闭 IPv6" || return 1
+  prompt_yes_no ENABLE_DOCKER "安装 Docker Engine 与 Docker Compose" || return 1
 }
 
 prompt_mode_selection() {
@@ -484,7 +491,10 @@ prompt_mode_selection() {
   echo "4) 自定义模式：逐项选择模块"
   local answer
   while true; do
-    read -r -p "请选择 [1-4，默认 1]: " answer || answer=""
+    if ! read -r -p "请选择 [1-4，默认 1]: " answer; then
+      print_err "未读取到选择，已停止执行。"
+      return 1
+    fi
     answer="$(trim "$answer")"
     case "$answer" in
       ""|1) MODE="recommended"; return 0 ;;

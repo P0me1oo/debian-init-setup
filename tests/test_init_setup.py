@@ -137,6 +137,49 @@ install() {
         self.assertNotIn("configure_swapfile", source)
         self.assertNotIn(" htop", source)
 
+    def run_custom_menu(self, answers, *arguments, expected=0):
+        options = shlex.join(("--interactive", "--mode", "custom", *arguments))
+        # 菜单回答使用独立输入，避免读取测试脚本自身。
+        body = (
+            f"parse_args {options}\n"
+            "apply_mode_defaults\napply_environment_overrides\napply_cli_overrides\n"
+            "prompt_configuration <<'MENU_ANSWERS'\n"
+            + "".join(answer + "\n" for answer in answers)
+            + "MENU_ANSWERS\napply_cli_overrides\nprint_config_summary\n"
+        )
+        return self.run_script(body, expected=expected)
+
+    def test_interactive_custom_enter_keeps_all_modules_enabled(self):
+        result = self.run_custom_menu([""] * 11)
+        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
+        self.assertNotIn(": 关闭/跳过", result.stdout)
+
+    def test_interactive_custom_no_disables_only_selected_module(self):
+        result = self.run_custom_menu([""] * 9 + ["n", ""])
+        self.assertEqual(result.stdout.count(": 开启\n"), 10, result.stdout)
+        self.assertIn("关闭 IPv6: 关闭/跳过", result.stdout)
+        self.assertIn("Docker: 开启", result.stdout)
+
+    def test_interactive_custom_enter_respects_explicit_disabled_modules(self):
+        result = self.run_custom_menu([""] * 11, "--disable", "ipv6,docker")
+        self.assertEqual(result.stdout.count(": 开启\n"), 9, result.stdout)
+        self.assertIn("关闭 IPv6: 关闭/跳过", result.stdout)
+        self.assertIn("Docker: 关闭/跳过", result.stdout)
+
+    def test_interactive_custom_input_interruption_stops(self):
+        result = self.run_custom_menu([], expected=1)
+        self.assertIn("未读取到选择，已停止执行", result.stdout)
+        self.assertNotIn("本次执行配置摘要", result.stdout)
+
+    def test_mode_selection_input_interruption_stops(self):
+        result = self.run_script(
+            "INTERACTIVE_MODE=yes\nMODE_EXPLICIT=0\n"
+            "prompt_mode_selection < /dev/null\nrecord_call after_prompt\n",
+            expected=1,
+        )
+        self.assertIn("未读取到选择，已停止执行", result.stdout)
+        self.assertNotIn("after_prompt", self.calls())
+
     def test_cli_module_overrides_follow_argument_order(self):
         result = self.run_script("parse_args --mode custom --enable docker --disable docker\napply_mode_defaults\napply_cli_overrides\nprintf 'docker=%s\\n' \"$ENABLE_DOCKER\"\n")
         self.assertIn("docker=no", result.stdout)
