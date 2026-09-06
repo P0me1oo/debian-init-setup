@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.0.2`
+- 当前版本：`3.0.3`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -56,18 +56,13 @@ bash init_setup.sh --mode custom
 需要在线下载，同时保留交互菜单时，先下载到文件再执行：
 
 ```bash
-curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh \
-  -o /tmp/init_setup.sh && \
-bash /tmp/init_setup.sh
+curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh -o /tmp/init.sh && bash /tmp/init.sh
 ```
 
 直接使用管道时不会进入交互菜单，必须显式提供 `--yes`：
 
 ```bash
-curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh \
-  | bash -s -- --yes --mode recommended
+curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh | bash -s -- --yes --mode recommended
 ```
 
 没有提供 `--yes` 的管道执行会被拒绝。
@@ -206,6 +201,10 @@ python -m unittest discover -s tests -v
 测试使用临时目录和模拟命令，不会修改当前机器的 SSH、防火墙或 Docker。真实服务、内核参数、软件源和重启后的状态仍需在 Debian 测试机上验证。
 
 ## 版本记录
+
+### 3.0.3
+
+- 精简 README 和命令文件中的在线启动命令，保留交互菜单和非交互执行所需的 `--yes` 参数。
 
 ### 3.0.2
 
