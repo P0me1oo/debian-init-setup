@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.0.3`
+- 当前版本：`3.0.4`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -51,21 +51,11 @@ bash init_setup.sh --mode custom
 
 ## 在线下载并保留交互菜单
 
-以下命令从本仓库的 `main` 分支下载脚本，可以直接复制使用。
-
-需要在线下载，同时保留交互菜单时，先下载到文件再执行：
+以 root 身份在终端中执行，下载完成后会显示推荐、精简、完整、自定义四种模式的菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh -o /tmp/init.sh && bash /tmp/init.sh
+curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh -o /tmp/init.sh && bash /tmp/init.sh --interactive
 ```
-
-直接使用管道时不会进入交互菜单，必须显式提供 `--yes`：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init_setup.sh | bash -s -- --yes --mode recommended
-```
-
-没有提供 `--yes` 的管道执行会被拒绝。
 
 ## 三种预设模式
 
@@ -201,6 +191,10 @@ python -m unittest discover -s tests -v
 测试使用临时目录和模拟命令，不会修改当前机器的 SSH、防火墙或 Docker。真实服务、内核参数、软件源和重启后的状态仍需在 Debian 测试机上验证。
 
 ## 版本记录
+
+### 3.0.4
+
+- 在线入口统一使用 `--interactive` 显示模式菜单，移除并列的无人值守在线命令。
 
 ### 3.0.3
 
