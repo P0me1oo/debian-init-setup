@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.0.5"
+SCRIPT_VERSION="3.1.0"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -66,6 +66,7 @@ CHECK_ONLY=0
 DRY_RUN=0
 STATUS_ONLY=0
 RESTORE_ONLY=0
+RESTORE_IPV6_ONLY=0
 LOCK_FD=""
 
 declare -a SOFT_ERRORS=()
@@ -121,6 +122,7 @@ usage() {
       --dry-run                    显示将执行的模块，不修改系统
       --status                     输出当前状态，不修改系统
       --restore                    恢复最近一次脚本备份的配置
+      --restore-ipv6                只恢复 IPv6，不执行初始化模块
       --replace-existing-runtime  允许 Docker 模块替换已有容器运行时
       --no-journal-limit           不配置 systemd journal 大小限制
       --no-nexttrace-mtr           不安装 NextTrace 和 mtr
@@ -134,6 +136,7 @@ usage() {
   bash init_setup.sh --yes --mode full
   bash init_setup.sh --yes --mode recommended --disable ipv6,docker
   bash init_setup.sh --check
+  bash init_setup.sh --yes --restore-ipv6
 USAGE
 }
 
@@ -301,6 +304,7 @@ parse_args() {
       --dry-run) DRY_RUN=1; INTERACTIVE_MODE="no"; shift ;;
       --status) STATUS_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --restore) RESTORE_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
+      --restore-ipv6) RESTORE_IPV6_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --replace-existing-runtime) REPLACE_EXISTING_RUNTIME=1; shift ;;
       --no-update|--no-upgrade) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(update); shift ;;
       --no-tools) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(tools); shift ;;
@@ -541,9 +545,17 @@ print_final_summary() {
   elapsed_sec="$((elapsed_sec % 60))"
 
   echo
-  print_section "10) 简短结果报告"
+  if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
+    print_section "IPv6 恢复结果"
+  else
+    print_section "10) 简短结果报告"
+  fi
   if [ "$exit_code" -eq 0 ] && [ "${#SOFT_ERRORS[@]}" -eq 0 ]; then
-    echo "执行结果: 全部成功"
+    if [ "$RESTORE_IPV6_ONLY" -eq 1 ] && [ "$IPV6_REBOOT_REQUIRED" -eq 1 ]; then
+      echo "执行结果: 恢复配置已完成，重启后生效"
+    else
+      echo "执行结果: 全部成功"
+    fi
     echo "错误部分: 无"
   else
     echo "执行结果: 部分错误"
@@ -710,7 +722,7 @@ update_system_packages() {
 }
 
 install_common_tools() {
-  apt_install curl wget git openssh-server iproute2
+  apt_install curl wget git openssh-server iproute2 sudo iperf3
   print_ok "常用工具安装完成"
 }
 
@@ -768,9 +780,45 @@ kernel_has_ipv6_disable_arg() {
   [ -r /proc/cmdline ] && tr ' ' '\n' < /proc/cmdline | grep -qxF 'ipv6.disable=1'
 }
 
+ipv6_interface_map() {
+  ip -o link show | awk -F ': ' '{ sub(/@.*/, "", $2); print $1 "\t" $2 }'
+}
+
+ipv6_snapshot_matches_boot() {
+  local saved_boot_id="${BACKUP_ROOT}/ipv6-runtime/boot-id"
+  if [ ! -s "$saved_boot_id" ] || [ ! -r "$saved_boot_id" ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
+    return 1
+  fi
+  # /proc 文件报告的大小为 0，cmp -s 可能只按大小误判；直接读取内容比较。
+  [ "$(<"$saved_boot_id")" = "$(</proc/sys/kernel/random/boot_id)" ]
+}
+
+save_ipv6_runtime_state() {
+  local state_dir="${BACKUP_ROOT}/ipv6-runtime"
+  command -v ip >/dev/null 2>&1 || { print_err "缺少 ip 命令，无法保存 IPv6 地址和路由，已停止关闭 IPv6。"; return 1; }
+  [ -d /proc/sys/net/ipv6/conf ] || return 0
+  kernel_has_ipv6_disable_arg && return 0
+  # 重复关闭时保留第一次的网络状态，防止用空地址覆盖可恢复的数据。
+  if ipv6_snapshot_matches_boot; then
+    if [ ! -r "$state_dir/addresses" ] || [ ! -r "$state_dir/routes" ] || [ ! -r "$state_dir/interfaces" ]; then
+      print_err "已有 IPv6 网络状态备份不完整，已停止关闭 IPv6：${state_dir}"
+      return 1
+    fi
+    return 0
+  fi
+  [ -r /proc/sys/kernel/random/boot_id ] || { print_err "无法读取本次启动标识，已停止关闭 IPv6。"; return 1; }
+  install -d -m 0700 "$state_dir" || return 1
+  ipv6_interface_map > "$state_dir/interfaces" || return 1
+  ip -6 address save scope global > "$state_dir/addresses" || return 1
+  ip -6 route save table all > "$state_dir/routes" || return 1
+  cp -- /proc/sys/kernel/random/boot_id "$state_dir/boot-id" || return 1
+  chmod 0600 "$state_dir/addresses" "$state_dir/routes" "$state_dir/interfaces" "$state_dir/boot-id" || return 1
+  print_ok "已保存 IPv6 地址和路由，供 --restore-ipv6 恢复。"
+}
+
 write_ipv6_sysctl_config() {
-  backup_file "/etc/sysctl.d/99-disable-ipv6.conf"
-  cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOF_IPV6
+  backup_file "/etc/sysctl.d/99-disable-ipv6.conf" || return 1
+  cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOF_IPV6 || return 1
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
@@ -819,7 +867,11 @@ disable_ipv6_runtime() {
 }
 
 grub_config_has_ipv6_disable_arg() {
-  grep -E '^[[:space:]]*GRUB_CMDLINE_LINUX(_DEFAULT)?=' /etc/default/grub 2>/dev/null | grep -Fq 'ipv6.disable=1'
+  local file="${1:-/etc/default/grub}"
+  [ -f "$file" ] || return 1
+  awk '/^[[:space:]]*GRUB_CMDLINE_LINUX(_DEFAULT)?=/ &&
+       /ipv6[.]disable=1([[:space:]"\047]|$)/ { found=1 }
+       END { exit !found }' "$file"
 }
 
 configure_ipv6_grub_persistence() {
@@ -838,8 +890,8 @@ configure_ipv6_grub_persistence() {
   fi
 
   if ! grub_config_has_ipv6_disable_arg; then
-    backup_file "/etc/default/grub"
-    cat >> /etc/default/grub <<'EOF_GRUB_IPV6'
+    backup_file "/etc/default/grub" || return 1
+    cat >> /etc/default/grub <<'EOF_GRUB_IPV6' || return 1
 
 # init-setup：在内核启动阶段彻底关闭 IPv6，避免网络管理器重新启用具体接口。
 GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX:+${GRUB_CMDLINE_LINUX} }ipv6.disable=1"
@@ -903,7 +955,8 @@ verify_ipv6_runtime_disabled() {
 configure_disable_ipv6() {
   local runtime_ok=1 persistence_ok=1 msg
 
-  write_ipv6_sysctl_config
+  save_ipv6_runtime_state || return 1
+  write_ipv6_sysctl_config || return 1
   disable_ipv6_runtime || runtime_ok=0
   configure_ipv6_grub_persistence || persistence_ok=0
   verify_ipv6_runtime_disabled || runtime_ok=0
@@ -915,6 +968,268 @@ configure_disable_ipv6() {
     print_ok "IPv6 当前运行时已关闭，持久化配置已完成。"
   else
     print_warn "IPv6 当前运行时已关闭，但启动阶段持久化配置未完全完成。"
+  fi
+}
+
+apply_ipv6_config_restore() {
+  local file="$1" temporary="$2"
+  if cmp -s "$file" "$temporary"; then
+    rm -f -- "$temporary"
+    return 0
+  fi
+  if ! backup_file "$file"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if [ -s "$temporary" ]; then
+    if ! cat "$temporary" > "$file"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+  elif ! rm -f -- "$file"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+restore_ipv6_grub_persistence() {
+  local file=/etc/default/grub dropin temporary
+  for dropin in /etc/default/grub.d/*.cfg; do
+    if grub_config_has_ipv6_disable_arg "$dropin"; then
+      print_err "另有 GRUB 配置禁用 IPv6：${dropin}。请先处理该启动参数，再运行恢复。"
+      return 1
+    fi
+  done
+  if [ ! -f "$file" ]; then
+    if kernel_has_ipv6_disable_arg; then
+      print_err "当前内核通过 ipv6.disable=1 启动，但没有可管理的 GRUB 配置；请先从实际启动器中移除此参数。"
+      return 1
+    fi
+    return 0
+  fi
+  if ! command -v update-grub >/dev/null 2>&1; then
+    if grub_config_has_ipv6_disable_arg || kernel_has_ipv6_disable_arg; then
+      print_err "缺少 update-grub，无法撤销 IPv6 启动参数。"
+      return 1
+    fi
+    return 0
+  fi
+  temporary="$(mktemp)" || return 1
+  # 删除脚本追加的整行；普通参数行只删除完整的禁用参数，保留其他启动设置。
+  if ! awk '
+    $0 == "# init-setup：在内核启动阶段彻底关闭 IPv6，避免网络管理器重新启用具体接口。" { next }
+    $0 == "GRUB_CMDLINE_LINUX=\"${GRUB_CMDLINE_LINUX:+${GRUB_CMDLINE_LINUX} }ipv6.disable=1\"" { next }
+    /^[[:space:]]*GRUB_CMDLINE_LINUX(_DEFAULT)?=/ {
+      while (match($0, /(^|[[:space:]"\047])ipv6[.]disable=1([[:space:]"\047]|$)/)) {
+        part=substr($0, RSTART, RLENGTH)
+        sub(/ipv6[.]disable=1/, "", part)
+        $0=substr($0, 1, RSTART-1) part substr($0, RSTART+RLENGTH)
+      }
+    }
+    { print }
+  ' "$file" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if grub_config_has_ipv6_disable_arg "$temporary"; then
+    rm -f -- "$temporary"
+    print_err "GRUB 中的 IPv6 参数写法无法自动处理，已保留原文件。"
+    return 1
+  fi
+  apply_ipv6_config_restore "$file" "$temporary" || return 1
+  # 即使源文件已清理也重新生成，允许重试上一次 update-grub 失败的恢复。
+  if ! update-grub >/dev/null; then
+    print_err "update-grub 执行失败，启动配置尚未恢复；修复后请重新运行 --restore-ipv6。"
+    return 1
+  fi
+  if [ -r /boot/grub/grub.cfg ] && awk '
+    /^[[:space:]]*linux(efi)?[[:space:]]/ && /(^|[[:space:]])ipv6[.]disable=1([[:space:]]|$)/ { found=1 }
+    END { exit !found }
+  ' /boot/grub/grub.cfg; then
+    print_err "生成的 GRUB 配置仍包含 ipv6.disable=1，请检查其他启动配置。"
+    return 1
+  fi
+  print_ok "GRUB 的 IPv6 禁用参数已清理。"
+}
+
+restore_ipv6_sysctl_config() {
+  local file=/etc/sysctl.d/99-disable-ipv6.conf temporary
+  [ -f "$file" ] || return 0
+  temporary="$(mktemp)" || return 1
+  if ! awk '
+    !/^[[:space:]]*net[.]ipv6[.]conf[.](all|default|lo)[.]disable_ipv6[[:space:]]*=[[:space:]]*1([[:space:]]*([#;].*)?)?$/
+  ' "$file" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  apply_ipv6_config_restore "$file" "$temporary" || return 1
+  print_ok "脚本写入的 IPv6 禁用系统参数已清理。"
+}
+
+restore_ipv6_ufw() {
+  local file=/etc/default/ufw temporary
+  [ -f "$file" ] || return 0
+  temporary="$(mktemp)" || return 1
+  if ! sed -E 's/^(IPV6=)no([[:space:]]*(#.*)?)$/\1yes\2/' "$file" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  apply_ipv6_config_restore "$file" "$temporary" || return 1
+  # UFW 的 IPV6=no 会丢弃 IPv6 流量。只重载已经启用的防火墙，保留现有规则。
+  if ! kernel_has_ipv6_disable_arg && grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+    if ! ufw reload; then
+      print_err "UFW 的 IPv6 支持重载失败，请修复后重新运行 --restore-ipv6。"
+      return 1
+    fi
+  fi
+}
+
+enable_ipv6_runtime() {
+  local setting iface failed=0
+  [ -d /proc/sys/net/ipv6/conf ] || { print_err "内核未提供 IPv6 配置，无法立即恢复。"; return 1; }
+  for setting in /proc/sys/net/ipv6/conf/all/disable_ipv6 /proc/sys/net/ipv6/conf/default/disable_ipv6 /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [ -e "$setting" ] || continue
+    if [ "$(<"$setting")" != 0 ] && ! printf '0\n' > "$setting"; then
+      iface="${setting#/proc/sys/net/ipv6/conf/}"
+      print_err "无法恢复 IPv6 开关：${iface}"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+parse_ifupdown_ipv6() {
+  # ifquery 已处理 source/source-directory；只读取 IPv6 地址、前缀和网关，不执行配置中的命令。
+  awk '
+    function flush_address() {
+      if (address !~ /:/) return
+      if (address !~ /\//) {
+        if (prefix !~ /^[0-9]+$/ || prefix > 128) { invalid=1; return }
+        address=address "/" prefix
+      }
+      print "address\t" address
+      if (gateway ~ /:/) print "gateway\t" gateway "\t" metric
+    }
+    $1 == "address:" { flush_address(); address=$2; prefix=""; gateway=""; metric="" }
+    $1 == "netmask:" { prefix=$2 }
+    $1 == "gateway:" { gateway=$2 }
+    $1 == "metric:" { metric=$2 }
+    END { flush_address(); exit invalid }
+  '
+}
+
+restore_ifupdown_ipv6() {
+  local interfaces iface details records kind value metric restored=0
+  if ! command -v ifquery >/dev/null 2>&1 ||
+     ! systemctl is-active --quiet networking; then
+    print_info "没有可用的 ifupdown 静态配置，等待网络管理服务分配 IPv6。"
+    return 0
+  fi
+  interfaces="$(ifquery --list --no-mappings)" || return 1
+  while IFS= read -r iface; do
+    if [ -z "$iface" ] || [ "$iface" = lo ]; then
+      continue
+    fi
+    ip link show dev "$iface" >/dev/null 2>&1 || continue
+    details="$(ifquery --no-mappings "$iface")" || return 1
+    if ! records="$(printf '%s\n' "$details" | parse_ifupdown_ipv6)"; then
+      print_err "接口 ${iface} 的 IPv6 静态地址缺少有效前缀，无法自动恢复。"
+      return 1
+    fi
+    while IFS=$'\t' read -r kind value metric; do
+      case "$kind" in
+        address)
+          ip -6 address replace "$value" dev "$iface" || return 1
+          restored=$((restored + 1))
+          ;;
+        gateway)
+          local -a route_args=(default via "$value" dev "$iface" onlink)
+          if [ -n "$metric" ]; then
+            [[ "$metric" =~ ^[0-9]+$ ]] || { print_err "接口 ${iface} 的 IPv6 路由 metric 无效。"; return 1; }
+            route_args+=(metric "$metric")
+          fi
+          ip -6 route replace "${route_args[@]}" || return 1
+          ;;
+      esac
+    done <<< "$records"
+  done <<< "$interfaces"
+  if [ "$restored" -gt 0 ]; then
+    print_ok "已按 ifupdown 配置恢复 ${restored} 个静态 IPv6 地址及其网关。"
+  fi
+}
+
+restore_ipv6_network_state() {
+  local state_dir="${BACKUP_ROOT}/ipv6-runtime" addresses routes interfaces
+  if ipv6_snapshot_matches_boot; then
+    if [ ! -r "$state_dir/addresses" ] || [ ! -r "$state_dir/routes" ] || [ ! -r "$state_dir/interfaces" ]; then
+      print_err "IPv6 网络状态备份不完整：${state_dir}"
+      return 1
+    fi
+    interfaces="$(ipv6_interface_map)" || return 1
+    if [ "$interfaces" = "$(<"$state_dir/interfaces")" ]; then
+      ip -6 address restore < "$state_dir/addresses" || return 1
+      ip -6 route restore < "$state_dir/routes" || return 1
+      print_ok "已恢复关闭前保存的 IPv6 地址和路由。"
+      return 0
+    fi
+    print_warn "网卡编号已变化，将按持久网络配置恢复 IPv6。"
+  fi
+  # ip 的二进制快照使用网卡编号，不跨重启重放；旧版无快照时也使用持久网络配置。
+  addresses="$(ip -6 -o address show scope global)" || return 1
+  routes="$(ip -6 route show default)" || return 1
+  if [ -z "$addresses" ] || [ -z "$routes" ]; then
+    restore_ifupdown_ipv6 || return 1
+  fi
+}
+
+verify_ipv6_runtime_enabled() {
+  local setting addresses routes attempt
+  for setting in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [ -e "$setting" ] || continue
+    if [ "$(<"$setting")" != 0 ]; then
+      print_err "IPv6 仍被禁用：${setting}"
+      return 1
+    fi
+  done
+  # 给地址冲突检测和路由通告留出时间，不把 tentative 地址当作已恢复。
+  for ((attempt=0; attempt<10; attempt++)); do
+    addresses="$(ip -6 -o address show scope global -tentative -dadfailed)" || return 1
+    routes="$(ip -6 route show default)" || return 1
+    if [ -n "$addresses" ] && [ -n "$routes" ]; then
+      print_ok "IPv6 已启用，已有可用的全局地址和默认路由。"
+      printf '%s\n' "$addresses" "$routes"
+      return 0
+    fi
+    sleep 1
+  done
+  print_err "IPv6 开关已恢复，但尚未取得可用的全局地址和默认路由；请检查持久网络配置及网络管理服务，再重新运行 --restore-ipv6。"
+  return 1
+}
+
+configure_restore_ipv6() {
+  local command_name state_dir="${BACKUP_ROOT}/ipv6-runtime"
+  for command_name in ip awk sed grep cmp mktemp cp; do
+    command -v "$command_name" >/dev/null 2>&1 || { print_err "缺少恢复 IPv6 所需的命令：${command_name}"; return 1; }
+  done
+  if grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null && ! command -v ufw >/dev/null 2>&1; then
+    print_err "UFW 已配置为启用，但缺少 ufw 命令，无法恢复 IPv6 防火墙支持。"
+    return 1
+  fi
+  restore_ipv6_grub_persistence || return 1
+  restore_ipv6_sysctl_config || return 1
+  restore_ipv6_ufw || return 1
+  if kernel_has_ipv6_disable_arg; then
+    IPV6_REBOOT_REQUIRED=1
+    print_warn "IPv6 禁用配置已撤销；当前内核仍通过 ipv6.disable=1 启动，需要重启服务器才能恢复 IPv6。本脚本不会自动重启。"
+    return 0
+  fi
+  enable_ipv6_runtime || return 1
+  restore_ipv6_network_state || return 1
+  verify_ipv6_runtime_enabled || return 1
+  if [ -d "$state_dir" ]; then
+    rm -f -- "$state_dir/addresses" "$state_dir/routes" "$state_dir/interfaces" "$state_dir/boot-id" || return 1
+    rmdir -- "$state_dir" || return 1
   fi
 }
 
@@ -1154,6 +1469,21 @@ detect_sshd_port_numbers() {
   return 1
 }
 
+run_ufw_preserving_ipv6_rules() {
+  local rules_file=/etc/ufw/user6.rules exit_code=0
+  if [ -f "$rules_file" ] && { grep -q '^IPV6=no' /etc/default/ufw 2>/dev/null || kernel_has_ipv6_disable_arg; }; then
+    # UFW 在 IPv6 禁用时重写日志设置会清空 user6.rules，保留原规则供恢复使用。
+    backup_file "$rules_file" || return 1
+    if ufw "$@"; then :; else exit_code=$?; fi
+    if ! restore_file_from_backup "$BACKUP_DIR" "$rules_file"; then
+      print_err "UFW 操作后未能保留 IPv6 规则，请检查备份：${BACKUP_DIR}"
+      return 1
+    fi
+    return "$exit_code"
+  fi
+  ufw "$@"
+}
+
 configure_ufw_firewall() {
   apt_install ufw iproute2
   local ssh_ports=() port
@@ -1168,13 +1498,13 @@ configure_ufw_firewall() {
     fi
   fi
   if is_yes "$ENABLE_DISABLE_IPV6" && [ -f /etc/default/ufw ]; then
-    backup_file /etc/default/ufw
-    sed -ri 's/^IPV6=.*/IPV6=no/' /etc/default/ufw || true
+    backup_file /etc/default/ufw || return 1
+    sed -ri 's/^IPV6=.*/IPV6=no/' /etc/default/ufw || return 1
   fi
-  ufw default deny incoming
-  ufw default allow outgoing
-  for port in "${ssh_ports[@]}"; do ufw allow "${port}/tcp"; done
-  ufw --force enable
+  run_ufw_preserving_ipv6_rules default deny incoming || return 1
+  run_ufw_preserving_ipv6_rules default allow outgoing || return 1
+  for port in "${ssh_ports[@]}"; do run_ufw_preserving_ipv6_rules allow "${port}/tcp" || return 1; done
+  run_ufw_preserving_ipv6_rules --force enable || return 1
   UFW_ALLOWED_SSH_PORTS=("${ssh_ports[@]}")
   print_ok "UFW 已启用，本次仅添加 SSH 放行，已有规则保留"
 }
@@ -1451,7 +1781,7 @@ print_execution_report() {
 
   echo "已安装常用工具版本:"
   local cmd
-  for cmd in curl wget git nexttrace mtr; do
+  for cmd in curl wget git sudo iperf3 nexttrace mtr; do
     if command -v "$cmd" >/dev/null 2>&1; then
       "$cmd" --version 2>/dev/null | print_first_line_safe || true
     fi
@@ -1522,6 +1852,27 @@ print_dry_run() {
 
 parse_args "$@"
 require_explicit_non_interactive
+if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
+  if [ "$RESTORE_ONLY" -eq 1 ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$STATUS_ONLY" -eq 1 ]; then
+    print_err "--restore-ipv6 不能与 --restore、--check 或 --status 同时使用。"
+    exit 2
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    print_section "模拟执行：只恢复 IPv6"
+    echo "撤销 IPv6 禁用配置，恢复 UFW 的 IPv6 支持，重新启用 IPv6 并恢复地址和路由。"
+    echo "若当前内核使用 ipv6.disable=1 启动，配置恢复后需要重启。"
+    exit 0
+  fi
+  require_root
+  prepare_logfile
+  acquire_run_lock
+  exec > >(tee -a "$LOGFILE") 2>&1
+  trap 'on_err ${LINENO} "$BASH_COMMAND"' ERR
+  trap 'on_exit $?' EXIT
+  print_section "只恢复 IPv6"
+  configure_restore_ipv6
+  exit $?
+fi
 normalize_all_booleans
 prompt_mode_selection
 apply_mode_defaults

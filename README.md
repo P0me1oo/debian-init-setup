@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.0.5`
+- 当前版本：`3.1.0`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -10,7 +10,7 @@
 | 模块 | 作用 |
 | --- | --- |
 | `update` | 更新系统软件包并执行升级 |
-| `tools` | 安装 curl、wget、git、openssh-server 和 iproute2 |
+| `tools` | 安装 curl、wget、git、openssh-server、iproute2、sudo 和 iperf3 |
 | `nexttrace-mtr` | 安装 NextTrace 和 mtr |
 | `bbr` | 配置 BBR + fq |
 | `ssh` | 配置 SSH 端口、密钥登录和密码登录策略 |
@@ -153,12 +153,37 @@ bash init_setup.sh --check
 bash init_setup.sh --dry-run --mode recommended
 bash init_setup.sh --status
 bash init_setup.sh --restore
+bash init_setup.sh --yes --restore-ipv6
 ```
 
 - `--check` 只检查运行环境；
 - `--dry-run` 只显示将启用的模块；
 - `--status` 输出当前服务和配置状态；
 - `--restore` 恢复最近一次由脚本创建的配置备份。
+- `--restore-ipv6` 只恢复 IPv6，不执行初始化模块。
+
+## 独立恢复 IPv6
+
+恢复被脚本关闭的 IPv6，以 root 身份执行：
+
+```bash
+bash init_setup.sh --yes --restore-ipv6
+```
+
+此参数直接进入 IPv6 恢复流程，不显示初始化菜单；即使同时指定模式或模块开关，也只执行 IPv6 恢复。不能与 `--restore`、`--check`、`--status` 同时使用。可以先预览：
+
+```bash
+bash init_setup.sh --restore-ipv6 --dry-run
+```
+
+恢复流程会备份并清理脚本写入的 IPv6 禁用系统参数和 GRUB 启动参数，恢复 UFW 的 IPv6 支持，并在 UFW 已启用时重载现有规则。随后开启各接口的 IPv6，并恢复地址和路由。本版本的 UFW 配置流程会保留已有 IPv6 规则，避免它们在禁用 IPv6 支持时被 UFW 清空；旧版运行时已经丢失的自定义规则仍需从原备份恢复。
+
+- 使用本版本关闭 IPv6 时，会先保存地址、路由和网卡编号。同一次系统启动内、网卡编号未变化时，恢复会使用这份快照；重复关闭不会覆盖第一次保存的数据。
+- 旧版关闭时没有快照，或快照因重启、网卡变化而不再适用时，会尝试从 Debian 的 ifupdown 静态网络配置恢复 IPv6 地址和网关。其他网络管理服务需要按自身配置重新分配地址。
+- 如果当前内核已经通过 `ipv6.disable=1` 启动，脚本会撤销禁用配置并提示重启，不会自动重启服务器。重启后可再次执行恢复命令检查结果。
+- 即时恢复只有在接口开关开启、存在可用的全局地址和默认路由时才报告成功；配置、备份或服务操作失败会返回非零退出码。地址和路由检查不代表已验证外部网络连通性。
+
+IPv6 恢复快照保存在 `/var/backups/debian-init-setup/ipv6-runtime/`，即时恢复验证成功后清理。配置文件备份仍按原有规则保留。恢复失败时根据错误提示处理后，可以重复执行同一命令。
 
 ## 备份和日志
 
@@ -190,7 +215,18 @@ python -m unittest discover -s tests -v
 
 测试使用临时目录和模拟命令，不会修改当前机器的 SSH、防火墙或 Docker。真实服务、内核参数、软件源和重启后的状态仍需在 Debian 测试机上验证。
 
+`3.1.0` 已在 Debian 12、静态 IPv6、已启用 UFW 的服务器上验证新版关闭后恢复、重复关闭与恢复，以及 `3.0.5` 关闭后由新版恢复。各次恢复后的 IPv6 HTTPS 访问均成功，IPv4 地址和路由、SSH 配置、已有 IPv4/IPv6 防火墙规则通过一致性检查。测试结束后已恢复原始配置。需要重启才能生效的分支通过隔离测试验证，未执行实机重启。
+
 ## 版本记录
+
+### 3.1.0
+
+- 增加 `--restore-ipv6` 独立恢复入口，支持预览、配置备份、UFW IPv6 恢复和地址、路由校验。
+- 关闭 IPv6 前保存网络状态，支持同次启动内恢复快照，并兼容旧版关闭后的 ifupdown 静态配置恢复。
+- UFW 禁用 IPv6 支持时保留已有 IPv6 用户规则，失败时也尝试恢复规则文件。
+- 区分即时恢复成功与需要重启才能生效，检查失败时保留恢复快照。
+- 常用工具增加 sudo 和 iperf3，执行报告同时显示其版本。
+- 补充独立入口、重复执行、备份失败、静态网络恢复和启动参数等回归测试。
 
 ### 3.0.5
 

@@ -39,9 +39,10 @@ class InitSetupTests(unittest.TestCase):
         if not cls.bash:
             raise RuntimeError("回归测试需要 Bash")
         source = SCRIPT.read_text(encoding="utf-8")
-        cls.definitions, separator, _ = source.partition('\nparse_args "$@"\n')
+        cls.definitions, separator, main = source.partition('\nparse_args "$@"\n')
         if not separator:
             raise RuntimeError("找不到主流程边界，拒绝执行脚本")
+        cls.main = separator + main
         cls.key_directory = make_test_directory()
         cls.addClassCleanup(remove_test_directory, cls.key_directory)
         cls.key_file = cls.key_directory / "test_key"
@@ -63,12 +64,14 @@ class InitSetupTests(unittest.TestCase):
         self.authorized_keys = self.root / "root" / ".ssh" / "authorized_keys"
         self.hardening_file = self.ssh_config.parent / "sshd_config.d" / "000-init-setup-hardening.conf"
 
-    def run_script(self, body, expected=0):
+    def run_script(self, body, expected=0, main_arguments=None):
         definitions = self.definitions
         for original, replacement in (
             ("/etc/", bash_path(self.root / "etc") + "/"),
             ("/root/.ssh", bash_path(self.root / "root" / ".ssh")),
             ("/run/sshd", bash_path(self.root / "run" / "sshd")),
+            ("/proc/", bash_path(self.root / "proc") + "/"),
+            ("/boot/", bash_path(self.root / "boot") + "/"),
         ):
             definitions = definitions.replace(original, replacement)
         setup = f"""
@@ -79,6 +82,8 @@ TEST_PRIVATE_KEY={shlex.quote(bash_path(self.key_file))}
 BACKUP_ROOT="$TEST_ROOT/backups"
 BACKUP_ID="2026-01-01-000000-1"
 BACKUP_DIR="$BACKUP_ROOT/$BACKUP_ID"
+LOGFILE="$TEST_ROOT/init.log"
+LOCKFILE="$TEST_ROOT/init.lock"
 export TMPDIR="$TEST_ROOT"
 record_call() {{ printf '%s\\n' "$*" >> "$TEST_LOG"; }}
 apt_install() {{ record_call apt_install "$@"; }}
@@ -88,6 +93,7 @@ update-grub() {{ record_call update-grub "$@"; }}
 ss() {{ return 1; }}
 sshd() {{ return 1; }}
 ufw() {{ record_call ufw "$@"; }}
+ip() {{ record_call ip "$@"; return 99; }}
 chown() {{ :; }}
 sleep() {{ :; }}
 trap 'on_exit $?' EXIT
@@ -105,6 +111,8 @@ install() {
   esac
 }
 '''
+        if main_arguments is not None:
+            body += "\nset -- " + shlex.join(main_arguments) + "\n" + self.main
         result = subprocess.run(
             [self.bash, "--noprofile", "--norc", "-s"],
             input=definitions + "\n" + setup + "\n" + body,
@@ -120,6 +128,60 @@ install() {
     def assert_ssh_config_unchanged(self):
         self.assertEqual(self.ssh_config.read_text(encoding="utf-8"), self.original_ssh_config)
         self.assertFalse(self.hardening_file.exists())
+
+    def write_fixture(self, path, content):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        return target
+
+    def prepare_ipv6_fixture(self, kernel_disabled=False):
+        self.write_fixture("proc/cmdline", "quiet" + (" ipv6.disable=1" if kernel_disabled else "") + "\n")
+        self.write_fixture("proc/sys/kernel/random/boot_id", "test-boot\n")
+        for interface in ("all", "default", "lo", "eth0"):
+            self.write_fixture(f"proc/sys/net/ipv6/conf/{interface}/disable_ipv6", "1\n")
+        self.ipv6_sysctl = self.write_fixture(
+            "etc/sysctl.d/99-disable-ipv6.conf",
+            "".join(f"net.ipv6.conf.{interface}.disable_ipv6 = 1\n" for interface in ("all", "default", "lo")),
+        )
+        self.ipv6_grub = self.write_fixture(
+            "etc/default/grub",
+            'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n'
+            'GRUB_CMDLINE_LINUX="console=ttyS0"\n'
+            '# init-setup：在内核启动阶段彻底关闭 IPv6，避免网络管理器重新启用具体接口。\n'
+            'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX:+${GRUB_CMDLINE_LINUX} }ipv6.disable=1"\n',
+        )
+        self.ipv6_ufw = self.write_fixture("etc/default/ufw", "IPV6=no\nDEFAULT_INPUT_POLICY=DROP\n")
+        self.write_fixture("etc/ufw/ufw.conf", "ENABLED=yes\n")
+
+    def prepare_ipv6_snapshot(self, boot_id="test-boot\n", interfaces="1\tlo\n2\teth0\n"):
+        for name, value in (("boot-id", boot_id), ("interfaces", interfaces),
+                            ("addresses", "saved-addresses\n"), ("routes", "saved-routes\n")):
+            self.write_fixture("backups/ipv6-runtime/" + name, value)
+        return self.root / "backups" / "ipv6-runtime"
+
+    IPV6_IP_MOCK = r'''
+ip() {
+  record_call ip "$@"
+  case "$*" in
+    '-o link show') printf '1: lo: <UP>\n2: eth0: <UP>\n' ;;
+    '-6 address save scope global') printf 'saved-addresses\n' ;;
+    '-6 route save table all') printf 'saved-routes\n' ;;
+    '-6 address restore') cat > "$TEST_ROOT/restored-addresses" ;;
+    '-6 route restore') cat > "$TEST_ROOT/restored-routes" ;;
+    '-6 -o address show scope global'*)
+      if [ "${TEST_IPV6_NO_ADDRESS:-0}" -eq 0 ]; then
+        printf '2: eth0 inet6 2001:db8::2/64 scope global\n'
+      fi ;;
+    '-6 route show default')
+      if [ "${TEST_IPV6_NO_ROUTE:-0}" -eq 0 ]; then
+        printf 'default via 2001:db8::1 dev eth0\n'
+      fi ;;
+    'link show dev '*|'-6 address replace '*|'-6 route replace '*) return 0 ;;
+    *) return 99 ;;
+  esac
+}
+'''
 
     def test_mode_defaults(self):
         for mode, expected in (
@@ -211,6 +273,280 @@ install() {
         )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("--yes", result.stdout + result.stderr)
+
+    def test_restore_ipv6_entry_does_not_run_initialization_modules(self):
+        self.prepare_ipv6_fixture()
+        snapshot = self.prepare_ipv6_snapshot()
+        result = self.run_script(self.IPV6_IP_MOCK + r'''
+require_root() { :; }
+prepare_logfile() { :; }
+acquire_run_lock() { :; }
+ENABLE_DOCKER=invalid
+''', main_arguments=["--yes", "--restore-ipv6", "--mode", "full", "--enable", "all"])
+        self.assertIn("IPv6 已启用", result.stdout)
+        self.assertFalse(snapshot.exists())
+        self.assertEqual((self.root / "restored-addresses").read_text(encoding="utf-8"), "saved-addresses\n")
+        self.assertEqual((self.root / "restored-routes").read_text(encoding="utf-8"), "saved-routes\n")
+        self.assertFalse(self.ipv6_sysctl.exists())
+        self.assertNotIn("ipv6.disable=1", self.ipv6_grub.read_text(encoding="utf-8"))
+        self.assertIn("IPV6=yes", self.ipv6_ufw.read_text(encoding="utf-8"))
+        for setting in (self.root / "proc/sys/net/ipv6/conf").glob("*/disable_ipv6"):
+            self.assertEqual(setting.read_text(encoding="utf-8"), "0\n")
+        for forbidden in ("apt_install ", "systemctl ", "sysctl --system", "ip -4 "):
+            self.assertNotIn(forbidden, self.calls())
+        self.assert_ssh_config_unchanged()
+
+    def test_restore_ipv6_dry_run_has_no_system_side_effects(self):
+        result = self.run_script("", main_arguments=["--restore-ipv6", "--dry-run", "--mode", "full"])
+        self.assertIn("模拟执行：只恢复 IPv6", result.stdout)
+        self.assertNotIn("安装 Docker", result.stdout)
+        self.assertEqual(self.calls(), "")
+        self.assertFalse((self.root / "init.log").exists())
+        self.assertFalse((self.root / "backups").exists())
+
+    def test_restore_ipv6_rejects_conflicting_maintenance_options(self):
+        for option in ("--restore", "--check", "--status"):
+            with self.subTest(option=option):
+                result = self.run_script("", expected=2, main_arguments=["--yes", "--restore-ipv6", option])
+                self.assertIn("不能与", result.stdout)
+                self.assertEqual(self.calls(), "")
+
+    def test_restore_ipv6_non_interactive_entry_requires_yes(self):
+        result = self.run_script(
+            "ORIGINAL_STDIN_IS_TTY=0\nORIGINAL_STDOUT_IS_TTY=0\n",
+            expected=2, main_arguments=["--restore-ipv6"],
+        )
+        self.assertIn("没有显式提供 --yes", result.stdout)
+        self.assertEqual(self.calls(), "")
+
+    def test_restore_ipv6_kernel_disabled_reports_pending_reboot(self):
+        self.prepare_ipv6_fixture(kernel_disabled=True)
+        result = self.run_script(self.IPV6_IP_MOCK + "RESTORE_IPV6_ONLY=1\nconfigure_restore_ipv6\n")
+        self.assertIn("需要重启服务器", result.stdout)
+        self.assertNotIn("执行结果: 全部成功", result.stdout)
+        self.assertFalse(self.ipv6_sysctl.exists())
+        self.assertNotIn("ipv6.disable=1", self.ipv6_grub.read_text(encoding="utf-8"))
+        self.assertIn("IPV6=yes", self.ipv6_ufw.read_text(encoding="utf-8"))
+        self.assertNotIn("ufw reload", self.calls())
+        self.assertNotIn("ip ", self.calls())
+        self.assertEqual((self.root / "proc/sys/net/ipv6/conf/eth0/disable_ipv6").read_text(encoding="utf-8"), "1\n")
+
+    def test_restore_ipv6_missing_grub_command_stops_before_runtime_changes(self):
+        self.prepare_ipv6_fixture()
+        original = self.ipv6_grub.read_text(encoding="utf-8")
+        result = self.run_script(self.IPV6_IP_MOCK + r'''
+command() {
+  if [ "$1" = '-v' ] && [ "$2" = 'update-grub' ]; then return 1; fi
+  builtin command "$@"
+}
+configure_restore_ipv6
+''', expected=1)
+        self.assertIn("缺少 update-grub", result.stdout)
+        self.assertEqual(self.ipv6_grub.read_text(encoding="utf-8"), original)
+        self.assertTrue(self.ipv6_sysctl.exists())
+        self.assertNotIn("ufw reload", self.calls())
+        self.assertNotIn("ip ", self.calls())
+
+    def test_restore_ipv6_grub_preserves_unrelated_arguments_and_can_repeat(self):
+        self.prepare_ipv6_fixture()
+        self.ipv6_grub.write_text(
+            'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX="console=ttyS0 ipv6.disable=1"\n'
+            "GRUB_CMDLINE_LINUX_DEFAULT='quiet ipv6.disable=1 ipv6.disable=10'\n",
+            encoding="utf-8",
+        )
+        self.run_script("restore_ipv6_grub_persistence\nrestore_ipv6_grub_persistence\n")
+        restored = self.ipv6_grub.read_text(encoding="utf-8")
+        self.assertIn("GRUB_DEFAULT=0", restored)
+        self.assertIn("console=ttyS0", restored)
+        self.assertIn("quiet", restored)
+        self.assertIn("ipv6.disable=10", restored)
+        self.assertEqual(restored.count("ipv6.disable="), 1)
+        self.assertEqual(self.calls().splitlines().count("update-grub"), 2)
+
+    def test_restore_ipv6_grub_dropin_conflict_leaves_configuration_untouched(self):
+        self.prepare_ipv6_fixture()
+        self.write_fixture("etc/default/grub.d/provider.cfg", 'GRUB_CMDLINE_LINUX="ipv6.disable=1"\n')
+        original = self.ipv6_grub.read_text(encoding="utf-8")
+        result = self.run_script("restore_ipv6_grub_persistence\n", expected=1)
+        self.assertIn("另有 GRUB 配置禁用 IPv6", result.stdout)
+        self.assertEqual(self.ipv6_grub.read_text(encoding="utf-8"), original)
+        self.assertEqual(self.calls(), "")
+
+    def test_restore_ipv6_backup_failure_preserves_each_configuration(self):
+        self.prepare_ipv6_fixture()
+        for function, file in (("restore_ipv6_grub_persistence", self.ipv6_grub),
+                               ("restore_ipv6_sysctl_config", self.ipv6_sysctl),
+                               ("restore_ipv6_ufw", self.ipv6_ufw)):
+            with self.subTest(function=function):
+                original = file.read_text(encoding="utf-8")
+                self.run_script("backup_file() { return 1; }\n" + function + "\n", expected=1)
+                self.assertEqual(file.read_text(encoding="utf-8"), original)
+                self.assertEqual(self.calls(), "")
+
+    def test_restore_ipv6_grub_generation_failure_can_be_retried(self):
+        self.prepare_ipv6_fixture()
+        result = self.run_script(r'''
+update-grub() {
+  record_call update-grub
+  if [ ! -f "$TEST_ROOT/grub-failed-once" ]; then
+    touch "$TEST_ROOT/grub-failed-once"
+    return 1
+  fi
+}
+if restore_ipv6_grub_persistence; then exit 99; fi
+restore_ipv6_grub_persistence
+''')
+        self.assertIn("update-grub 执行失败", result.stdout)
+        self.assertNotIn("ipv6.disable=1", self.ipv6_grub.read_text(encoding="utf-8"))
+        self.assertEqual(self.calls().splitlines().count("update-grub"), 2)
+
+    def test_restore_ipv6_detects_remaining_generated_boot_argument(self):
+        self.prepare_ipv6_fixture()
+        self.write_fixture("boot/grub/grub.cfg", "linux /boot/vmlinuz root=/dev/vda1 ipv6.disable=1\n")
+        result = self.run_script(self.IPV6_IP_MOCK + "configure_restore_ipv6\n", expected=1)
+        self.assertIn("生成的 GRUB 配置仍包含", result.stdout)
+        self.assertTrue(self.ipv6_sysctl.exists())
+        self.assertNotIn("ip ", self.calls())
+
+    def test_restore_ipv6_sysctl_keeps_unrelated_settings(self):
+        self.prepare_ipv6_fixture()
+        self.ipv6_sysctl.write_text(
+            "net.ipv6.conf.all.disable_ipv6 = 1\n"
+            "net.ipv6.conf.default.disable_ipv6 = 1 # 禁用设置\n"
+            "net.ipv6.conf.lo.disable_ipv6=1\n"
+            "net.ipv4.ip_forward = 1\n# 保留说明\n",
+            encoding="utf-8",
+        )
+        self.run_script("restore_ipv6_sysctl_config\nrestore_ipv6_sysctl_config\n")
+        self.assertEqual(self.ipv6_sysctl.read_text(encoding="utf-8"), "net.ipv4.ip_forward = 1\n# 保留说明\n")
+        self.assertNotIn("sysctl --system", self.calls())
+
+    def test_restore_ipv6_firewall_reload_failure_stops_runtime_changes(self):
+        self.prepare_ipv6_fixture()
+        result = self.run_script(self.IPV6_IP_MOCK + r'''
+ufw() { record_call ufw "$@"; return 1; }
+configure_restore_ipv6
+''', expected=1)
+        self.assertIn("IPv6 支持重载失败", result.stdout)
+        self.assertNotIn("ip ", self.calls())
+        self.assertEqual((self.root / "proc/sys/net/ipv6/conf/eth0/disable_ipv6").read_text(encoding="utf-8"), "1\n")
+
+    def test_restore_ipv6_does_not_enable_an_inactive_firewall(self):
+        self.prepare_ipv6_fixture()
+        self.write_fixture("etc/ufw/ufw.conf", "ENABLED=no\n")
+        self.run_script("restore_ipv6_ufw\n")
+        self.assertEqual(self.ipv6_ufw.read_text(encoding="utf-8"), "IPV6=yes\nDEFAULT_INPUT_POLICY=DROP\n")
+        self.assertEqual(self.calls(), "")
+
+    def test_disable_ipv6_preserves_first_network_snapshot(self):
+        self.prepare_ipv6_fixture()
+        self.run_script(self.IPV6_IP_MOCK + "save_ipv6_runtime_state\nip() { return 99; }\nsave_ipv6_runtime_state\n")
+        snapshot = self.root / "backups/ipv6-runtime"
+        self.assertEqual((snapshot / "addresses").read_text(encoding="utf-8"), "saved-addresses\n")
+        self.assertEqual((snapshot / "routes").read_text(encoding="utf-8"), "saved-routes\n")
+        self.assertEqual(self.calls().splitlines().count("ip -6 address save scope global"), 1)
+
+    @unittest.skipUnless(Path("/proc/sys/kernel/random/boot_id").is_file(), "需要 Linux 的 /proc 启动标识")
+    def test_ipv6_snapshot_reads_real_proc_boot_id_contents(self):
+        self.prepare_ipv6_fixture()
+        boot_id = self.root / "proc/sys/kernel/random/boot_id"
+        boot_id.unlink()
+        # 使用真正的 /proc 只读文件，覆盖文件大小为 0、实际内容非空的情况。
+        boot_id.symlink_to("/proc/sys/kernel/random/boot_id")
+        self.run_script(self.IPV6_IP_MOCK +
+                        "save_ipv6_runtime_state\nsave_ipv6_runtime_state\nrestore_ipv6_network_state\n")
+        self.assertEqual(self.calls().splitlines().count("ip -6 address save scope global"), 1)
+        self.assertEqual((self.root / "restored-addresses").read_text(encoding="utf-8"), "saved-addresses\n")
+        self.assertEqual((self.root / "restored-routes").read_text(encoding="utf-8"), "saved-routes\n")
+
+    def test_disable_ipv6_snapshot_failure_stops_before_disabling_network(self):
+        self.prepare_ipv6_fixture()
+        original = self.ipv6_grub.read_text(encoding="utf-8")
+        self.run_script(r'''
+ip() {
+  record_call ip "$@"
+  if [ "$*" = '-6 route save table all' ]; then return 1; fi
+  printf 'state\n'
+}
+configure_disable_ipv6
+''', expected=1)
+        self.assertEqual(self.ipv6_grub.read_text(encoding="utf-8"), original)
+        self.assertNotIn("sysctl ", self.calls())
+        self.assertFalse((self.root / "backups/ipv6-runtime/boot-id").exists())
+
+    def test_restore_ipv6_does_not_replay_snapshots_after_boot_or_interface_changes(self):
+        self.prepare_ipv6_fixture()
+        for boot_id, interfaces in (("old-boot\n", "1\tlo\n2\teth0\n"),
+                                    ("test-boot\n", "1\tlo\n3\teth0\n")):
+            with self.subTest(boot_id=boot_id, interfaces=interfaces):
+                self.trace_file.unlink(missing_ok=True)
+                self.prepare_ipv6_snapshot(boot_id, interfaces)
+                self.run_script(self.IPV6_IP_MOCK + r'''
+TEST_IPV6_NO_ADDRESS=1
+restore_ifupdown_ipv6() { record_call restore_ifupdown_ipv6; }
+restore_ipv6_network_state
+''')
+                self.assertIn("restore_ifupdown_ipv6", self.calls())
+                self.assertNotIn("ip -6 address restore", self.calls())
+                self.assertNotIn("ip -6 route restore", self.calls())
+
+    def test_restore_ipv6_incomplete_snapshot_is_reported_and_retained(self):
+        self.prepare_ipv6_fixture()
+        snapshot = self.prepare_ipv6_snapshot()
+        (snapshot / "routes").unlink()
+        result = self.run_script(self.IPV6_IP_MOCK + "configure_restore_ipv6\n", expected=1)
+        self.assertIn("IPv6 网络状态备份不完整", result.stdout)
+        self.assertTrue((snapshot / "addresses").exists())
+        self.assertNotIn("ip -6 address restore", self.calls())
+
+    def test_restore_ipv6_requires_both_usable_address_and_default_route(self):
+        for missing in ("TEST_IPV6_NO_ADDRESS", "TEST_IPV6_NO_ROUTE"):
+            with self.subTest(missing=missing):
+                self.prepare_ipv6_fixture()
+                snapshot = self.prepare_ipv6_snapshot()
+                result = self.run_script(self.IPV6_IP_MOCK + missing + "=1\nconfigure_restore_ipv6\n", expected=1)
+                self.assertIn("尚未取得可用的全局地址和默认路由", result.stdout)
+                self.assertNotIn("IPv6 已启用，已有可用", result.stdout)
+                self.assertTrue((snapshot / "addresses").exists())
+                self.assertIn("-tentative -dadfailed", self.calls())
+
+    def test_restore_ifupdown_ipv6_ignores_ipv4_and_preserves_ipv6_gateway_metric(self):
+        self.prepare_ipv6_fixture()
+        self.write_fixture(
+            "ifquery-output",
+            "address: 192.0.2.2\nnetmask: 255.255.255.0\ngateway: 192.0.2.1\n"
+            "address: 2001:db8::2\ngateway: fe80::1\nnetmask: 64\nmetric: 42\n"
+            "post-up: invalid-command\naddress: 2001:db8::3/64\n",
+        )
+        self.run_script(self.IPV6_IP_MOCK + r'''
+systemctl() { record_call systemctl "$@"; }
+ifquery() {
+  if [ "$1" = '--list' ]; then printf 'lo\neth0\n'; else cat "$TEST_ROOT/ifquery-output"; fi
+}
+restore_ifupdown_ipv6
+''')
+        self.assertIn("ip -6 address replace 2001:db8::2/64 dev eth0", self.calls())
+        self.assertIn("ip -6 address replace 2001:db8::3/64 dev eth0", self.calls())
+        self.assertIn("ip -6 route replace default via fe80::1 dev eth0 onlink metric 42", self.calls())
+        for forbidden in ("192.0.2.", "invalid-command", "systemctl restart", "ip -4 "):
+            self.assertNotIn(forbidden, self.calls())
+
+    def test_restore_ifupdown_ipv6_missing_prefix_does_not_apply_partial_addresses(self):
+        self.prepare_ipv6_fixture()
+        result = self.run_script(self.IPV6_IP_MOCK + r'''
+systemctl() { return 0; }
+ifquery() {
+  if [ "$1" = '--list' ]; then
+    printf 'eth0\n'
+  else
+    printf 'address: 2001:db8::2/64\naddress: 2001:db8::3\ngateway: fe80::1\n'
+  fi
+}
+restore_ifupdown_ipv6
+''', expected=1)
+        self.assertIn("缺少有效前缀", result.stdout)
+        self.assertNotIn("ip -6 address replace", self.calls())
+        self.assertNotIn("ip -6 route replace", self.calls())
 
     def test_unsafe_log_directory_is_rejected_before_permission_changes(self):
         log_directory = self.root / "logs"
@@ -428,6 +764,40 @@ printf 'allowed_ssh=%s\n' "${UFW_ALLOWED_SSH_PORTS[*]}"
         rules = [line for line in self.calls().splitlines() if line.startswith("ufw allow ")]
         self.assertEqual(rules, ["ufw allow 10721/tcp"])
         self.assertIn("allowed_ssh=10721", result.stdout)
+
+    def test_ufw_keeps_ipv6_rules_while_disabling_ipv6_support(self):
+        self.write_fixture("etc/default/ufw", "IPV6=yes\n")
+        original = "# 已有 IPv6 规则\n-A ufw6-user-input -p tcp --dport 443 -j ACCEPT\n"
+        rules = self.write_fixture("etc/ufw/user6.rules", original)
+        self.run_script(r'''
+ENABLE_DISABLE_IPV6=yes
+SSH_READY=1
+ufw() {
+  record_call ufw "$@"
+  : > "$TEST_ROOT/etc/ufw/user6.rules"
+}
+configure_ufw_firewall
+''')
+        self.assertEqual(rules.read_text(encoding="utf-8"), original)
+        self.assertIn("IPV6=no", (self.root / "etc/default/ufw").read_text(encoding="utf-8"))
+        self.assertIn("ufw --force enable", self.calls())
+
+    def test_ufw_failure_retains_ipv6_rules_and_stops_configuration(self):
+        self.write_fixture("etc/default/ufw", "IPV6=no\n")
+        original = "# 已有 IPv6 规则\n-A ufw6-user-input -p tcp --dport 443 -j ACCEPT\n"
+        rules = self.write_fixture("etc/ufw/user6.rules", original)
+        self.run_script(r'''
+ENABLE_DISABLE_IPV6=no
+SSH_READY=1
+ufw() {
+  record_call ufw "$@"
+  : > "$TEST_ROOT/etc/ufw/user6.rules"
+  return 1
+}
+configure_ufw_firewall
+''', expected=1)
+        self.assertEqual(rules.read_text(encoding="utf-8"), original)
+        self.assertNotIn("ufw --force enable", self.calls())
 
     def test_bbr_without_modprobe_applies_only_its_own_configuration(self):
         (self.root / "etc" / "sysctl.d").mkdir()
