@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.1.0`
+- 当前版本：`3.1.1`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -61,14 +61,14 @@ curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init
 
 ### 推荐模式
 
-启用：
+默认启用：
 
 ```text
 update, tools, nexttrace-mtr, bbr, ssh, ufw,
 fail2ban, journald, timezone
 ```
 
-不执行关闭 IPv6，不安装 Docker：
+默认跳过：关闭 IPv6、安装 Docker。
 
 ```bash
 bash init_setup.sh --yes --mode recommended
@@ -76,11 +76,13 @@ bash init_setup.sh --yes --mode recommended
 
 ### 精简模式
 
-只启用：
+默认启用：
 
 ```text
 update, bbr, ssh, ufw, journald, timezone
 ```
+
+默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、关闭 IPv6、安装 Docker。
 
 ```bash
 bash init_setup.sh --yes --mode minimal
@@ -88,13 +90,13 @@ bash init_setup.sh --yes --mode minimal
 
 ### 完整模式
 
-启用当前脚本提供的全部模块：
+默认启用：全部模块。
 
 ```bash
 bash init_setup.sh --yes --mode full
 ```
 
-完整模式包含关闭 IPv6 和安装 Docker。Docker 模块检测到已有 Docker、Podman、containerd 命令或相关软件包时会停止，包括通过 Docker 官方软件源安装的版本。确认需要替换时使用：
+Docker 模块检测到已有 Docker、Podman、containerd 命令或相关软件包时会停止，包括通过 Docker 官方软件源安装的版本。确认需要替换时使用：
 
 ```bash
 bash init_setup.sh --yes --mode full --replace-existing-runtime
@@ -218,6 +220,11 @@ python -m unittest discover -s tests -v
 `3.1.0` 已在 Debian 12、静态 IPv6、已启用 UFW 的服务器上验证新版关闭后恢复、重复关闭与恢复，以及 `3.0.5` 关闭后由新版恢复。各次恢复后的 IPv6 HTTPS 访问均成功，IPv4 地址和路由、SSH 配置、已有 IPv4/IPv6 防火墙规则通过一致性检查。测试结束后已恢复原始配置。需要重启才能生效的分支通过隔离测试验证，未执行实机重启。
 
 ## 版本记录
+
+### 3.1.1
+
+- 推荐和精简模式列出默认启用及默认跳过的模块，完整模式显示“默认启用：全部模块”。
+- 推荐模式介绍补全系统更新、NextTrace 和 mtr、BBR + fq，并同步更新三种预设模式的文档。
 
 ### 3.1.0
 

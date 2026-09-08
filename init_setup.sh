@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.1.1"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -489,9 +489,14 @@ prompt_mode_selection() {
   should_prompt || return 0
   [ "$MODE_EXPLICIT" -eq 1 ] && return 0
   print_section "0) 选择运行模式"
-  echo "1) 推荐模式：常用工具、网络优化、SSH、防火墙、Fail2ban、日志限制和时间同步"
-  echo "2) 精简模式：系统更新、BBR + fq、SSH、防火墙、日志限制和时间同步"
-  echo "3) 完整模式：启用全部模块"
+  echo "1) 推荐模式"
+  echo "   默认启用：系统更新、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制和时间同步"
+  echo "   默认跳过：关闭 IPv6、安装 Docker"
+  echo "2) 精简模式"
+  echo "   默认启用：系统更新、BBR + fq、SSH、防火墙、日志限制和时间同步"
+  echo "   默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、关闭 IPv6、安装 Docker"
+  echo "3) 完整模式"
+  echo "   默认启用：全部模块"
   echo "4) 自定义模式：逐项选择模块"
   local answer
   while true; do
