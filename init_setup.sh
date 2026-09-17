@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.2.0"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -26,6 +26,7 @@ SSH_READY=0
 SSH_SERVICE_RELOADED=0
 IPV6_REBOOT_REQUIRED=0
 IPV6_PERSISTENCE_READY=0
+IPV6_DNS_CHANGED_FILES=0
 INTERACTIVE_MODE="${INTERACTIVE_MODE:-auto}"
 ORIGINAL_STDIN_IS_TTY=0
 ORIGINAL_STDOUT_IS_TTY=0
@@ -923,6 +924,216 @@ EOF_GRUB_IPV6
   return 0
 }
 
+# 只处理 DNS 服务器地址：nameserver 行、systemd 的 DNS=/FallbackDNS= 和 ifupdown 的 dns-nameservers。
+IPV6_DNS_FILTER_AWK='
+function is_ipv6_address(token,   colons) {
+  sub(/#.*$/, "", token)
+  if (token == "") return 0
+  if (token ~ /^\[/) return 1
+  colons = gsub(/:/, ":", token)
+  # IPv4 带端口只有一个冒号，IPv6 至少两个。
+  return colons >= 2
+}
+function filter_addresses(value,   kept, total, position, parts) {
+  kept = ""
+  total = split(value, parts, /[[:space:]]+/)
+  for (position = 1; position <= total; position++) {
+    if (parts[position] == "") continue
+    if (is_ipv6_address(parts[position])) {
+      print parts[position] > removed
+      removed_count++
+      continue
+    }
+    kept = kept (kept == "" ? "" : " ") parts[position]
+  }
+  return kept
+}
+style == "nameserver" {
+  if (match($0, /^[[:space:]]*nameserver[[:space:]]+/)) {
+    split(substr($0, RLENGTH + 1), fields, /[[:space:]]+/)
+    if (is_ipv6_address(fields[1])) {
+      print fields[1] > removed
+      removed_count++
+      next
+    }
+  }
+  print
+  next
+}
+style == "option" {
+  if (match($0, /^[[:space:]]*(DNS|FallbackDNS)[[:space:]]*=[[:space:]]*/)) {
+    before = removed_count
+    head = substr($0, 1, RLENGTH)
+    kept = filter_addresses(substr($0, RLENGTH + 1))
+    # 保留键名和等号；systemd 把空值当作清空该列表。
+    if (removed_count > before) {
+      print head kept
+      next
+    }
+  }
+  print
+  next
+}
+style == "ifupdown" {
+  if (match($0, /^[[:space:]]*dns-nameservers?[[:space:]]+/)) {
+    before = removed_count
+    head = substr($0, 1, RLENGTH)
+    kept = filter_addresses(substr($0, RLENGTH + 1))
+    if (removed_count > before) {
+      # 地址全是 IPv6 时删除整行，避免留下没有值的选项。
+      if (kept != "") print head kept
+      next
+    }
+  }
+  print
+  next
+}
+{ print }
+'
+
+ipv6_dns_config_targets() {
+  # 输出「处理方式<TAB>文件」；只列出持久化的上游配置，生成的 /etc/resolv.conf 最后单独处理。
+  local file
+  for file in /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf \
+              /etc/systemd/network/*.network /etc/systemd/network/*.network.d/*.conf; do
+    if [ -f "$file" ]; then printf 'option\t%s\n' "$file"; fi
+  done
+  for file in /etc/resolvconf/resolv.conf.d/head /etc/resolvconf/resolv.conf.d/base /etc/resolvconf/resolv.conf.d/tail; do
+    if [ -f "$file" ]; then printf 'nameserver\t%s\n' "$file"; fi
+  done
+  for file in /etc/network/interfaces /etc/network/interfaces.d/*; do
+    if [ -f "$file" ]; then printf 'ifupdown\t%s\n' "$file"; fi
+  done
+  return 0
+}
+
+ipv6_dns_apply_filtered() {
+  # 记录改动前后的内容，供 --restore-ipv6 判断文件是否仍是脚本写入的版本。
+  local file="$1" filtered="$2" state_dir="${BACKUP_ROOT}/ipv6-dns" index="" count=0
+  install -d -m 0700 "$state_dir" || return 1
+  if [ -f "$state_dir/manifest" ]; then
+    index="$(awk -F '\t' -v target="$file" '$2 == target { print $1; exit }' "$state_dir/manifest")" || return 1
+  fi
+  if [ -z "$index" ]; then
+    # 重复关闭时保留第一次记录的原始内容，不让已过滤的版本覆盖它。
+    [ ! -f "$state_dir/manifest" ] || count="$(awk 'END { print NR }' "$state_dir/manifest")" || return 1
+    index="$((count + 1))"
+    cp -a -- "$file" "$state_dir/${index}.original" || return 1
+    printf '%s\t%s\n' "$index" "$file" >> "$state_dir/manifest" || return 1
+  fi
+  backup_file "$file" || return 1
+  cat "$filtered" > "$file" || return 1
+  cp -a -- "$file" "$state_dir/${index}.applied" || return 1
+  chmod 0600 "$state_dir/manifest" "$state_dir/${index}.original" "$state_dir/${index}.applied" || return 1
+}
+
+filter_ipv6_dns_file() {
+  local style="$1" file="$2" filtered removed addresses
+  filtered="$(mktemp)" || return 1
+  if ! removed="$(mktemp)"; then
+    rm -f -- "$filtered"
+    return 1
+  fi
+  if ! awk -v style="$style" -v removed="$removed" "$IPV6_DNS_FILTER_AWK" "$file" > "$filtered"; then
+    rm -f -- "$filtered" "$removed"
+    print_err "解析 DNS 配置失败：${file}"
+    return 1
+  fi
+  if cmp -s "$file" "$filtered"; then
+    rm -f -- "$filtered" "$removed"
+    return 0
+  fi
+  if ! ipv6_dns_apply_filtered "$file" "$filtered"; then
+    rm -f -- "$filtered" "$removed"
+    print_err "写入 DNS 配置失败：${file}"
+    return 1
+  fi
+  addresses="$(trim "$(tr '\n' ' ' < "$removed")")"
+  rm -f -- "$filtered" "$removed"
+  IPV6_DNS_CHANGED_FILES=$((IPV6_DNS_CHANGED_FILES + 1))
+  print_info "${file}：已移除 IPv6 DNS ${addresses}"
+}
+
+ipv6_dns_refresh_resolvers() {
+  # 改动上游配置后让解析服务重新生成 /etc/resolv.conf。
+  local msg failed=0
+  if [ -d /etc/resolvconf/resolv.conf.d ] && command -v resolvconf >/dev/null 2>&1; then
+    if ! resolvconf -u >/dev/null; then
+      msg="resolvconf -u 执行失败，DNS 配置可能尚未重新生成。"
+      print_warn "$msg"; record_soft_error "$msg"; failed=1
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if command -v networkctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd; then
+      if ! networkctl reload >/dev/null; then
+        msg="networkctl reload 执行失败，systemd-networkd 的 DNS 改动可能尚未生效。"
+        print_warn "$msg"; record_soft_error "$msg"; failed=1
+      fi
+    fi
+    if systemctl is-active --quiet systemd-resolved; then
+      if ! systemctl try-restart systemd-resolved; then
+        msg="systemd-resolved 重启失败，DNS 改动可能尚未生效。"
+        print_warn "$msg"; record_soft_error "$msg"; failed=1
+      fi
+    fi
+  fi
+  return "$failed"
+}
+
+verify_ipv6_dns_config() {
+  local keyword address ipv4_count=0 ipv6_count=0 msg issues=0
+  if [ ! -r /etc/resolv.conf ]; then
+    print_info "没有可读取的 /etc/resolv.conf，跳过 DNS 校验。"
+    return 0
+  fi
+  while read -r keyword address _; do
+    [ "$keyword" = nameserver ] || continue
+    case "$address" in
+      "") ;;
+      *:*) ipv6_count=$((ipv6_count + 1)) ;;
+      *) ipv4_count=$((ipv4_count + 1)) ;;
+    esac
+  done < /etc/resolv.conf
+  if [ "$ipv6_count" -gt 0 ]; then
+    msg="/etc/resolv.conf 中仍有 ${ipv6_count} 条 IPv6 nameserver，可能由未覆盖的网络管理服务重新写入。"
+    print_warn "$msg"; record_soft_error "$msg"; issues=1
+  fi
+  if [ "$ipv4_count" -eq 0 ]; then
+    msg="当前没有可用的 IPv4 DNS，域名解析将无法工作；请手工写入一条 IPv4 nameserver 或执行 --restore-ipv6 还原。"
+    print_warn "$msg"; record_soft_error "$msg"; issues=1
+  fi
+  [ "$issues" -eq 0 ] || return 1
+  print_ok "DNS 校验通过：保留 ${ipv4_count} 条 IPv4 nameserver，无 IPv6 nameserver。"
+}
+
+configure_ipv6_dns() {
+  local targets style file failed=0
+  IPV6_DNS_CHANGED_FILES=0
+  if ! command -v awk >/dev/null 2>&1 || ! command -v cmp >/dev/null 2>&1; then
+    local msg="缺少 awk 或 cmp，未处理 DNS 配置中的 IPv6 nameserver。"
+    print_warn "$msg"; record_soft_error "$msg"
+    return 1
+  fi
+  targets="$(ipv6_dns_config_targets)" || return 1
+  if [ -n "$targets" ]; then
+    while IFS=$'\t' read -r style file; do
+      [ -n "$style" ] && [ -n "$file" ] || continue
+      filter_ipv6_dns_file "$style" "$file" || failed=1
+    done <<< "$targets"
+  fi
+  ipv6_dns_refresh_resolvers || failed=1
+  if [ -L /etc/resolv.conf ]; then
+    print_info "/etc/resolv.conf 由解析服务生成，已改动其上游配置，由该服务重新生成。"
+  elif [ -f /etc/resolv.conf ]; then
+    filter_ipv6_dns_file nameserver /etc/resolv.conf || failed=1
+  fi
+  if [ "$IPV6_DNS_CHANGED_FILES" -eq 0 ]; then
+    print_info "DNS 配置中没有 IPv6 nameserver，无需改动。"
+  fi
+  verify_ipv6_dns_config || failed=1
+  [ "$failed" -eq 0 ]
+}
+
 verify_ipv6_runtime_disabled() {
   local setting iface value global_addresses default_routes issues=""
 
@@ -958,19 +1169,22 @@ verify_ipv6_runtime_disabled() {
 }
 
 configure_disable_ipv6() {
-  local runtime_ok=1 persistence_ok=1 msg
+  local runtime_ok=1 persistence_ok=1 dns_ok=1 msg
 
   save_ipv6_runtime_state || return 1
   write_ipv6_sysctl_config || return 1
   disable_ipv6_runtime || runtime_ok=0
   configure_ipv6_grub_persistence || persistence_ok=0
+  configure_ipv6_dns || dns_ok=0
   verify_ipv6_runtime_disabled || runtime_ok=0
 
   if [ "$runtime_ok" -eq 0 ]; then
     msg="IPv6 未能在所有现有接口上完全关闭，请检查网络管理服务和上方校验结果。"
     record_soft_error "$msg"
-  elif [ "$persistence_ok" -eq 1 ]; then
-    print_ok "IPv6 当前运行时已关闭，持久化配置已完成。"
+  elif [ "$persistence_ok" -eq 1 ] && [ "$dns_ok" -eq 1 ]; then
+    print_ok "IPv6 当前运行时已关闭，DNS 只保留 IPv4，持久化配置已完成。"
+  elif [ "$dns_ok" -eq 0 ]; then
+    print_warn "IPv6 当前运行时已关闭，但 DNS 配置未完全处理。"
   else
     print_warn "IPv6 当前运行时已关闭，但启动阶段持久化配置未完全完成。"
   fi
@@ -1088,6 +1302,52 @@ restore_ipv6_ufw() {
       return 1
     fi
   fi
+}
+
+ipv6_dns_clear_state() {
+  local state_dir="${BACKUP_ROOT}/ipv6-dns" index
+  [ -f "$state_dir/manifest" ] || return 0
+  while IFS=$'\t' read -r index _; do
+    [ -n "$index" ] || continue
+    rm -f -- "$state_dir/${index}.original" "$state_dir/${index}.applied" || return 1
+  done < "$state_dir/manifest"
+  rm -f -- "$state_dir/manifest" || return 1
+  rmdir -- "$state_dir" || return 1
+}
+
+restore_ipv6_dns() {
+  local state_dir="${BACKUP_ROOT}/ipv6-dns" index file restored=0 skipped=0
+  [ -f "$state_dir/manifest" ] || return 0
+  while IFS=$'\t' read -r index file; do
+    [ -n "$index" ] && [ -n "$file" ] || continue
+    if [ ! -f "$state_dir/${index}.original" ]; then
+      print_err "DNS 配置备份不完整：${state_dir}/${index}.original"
+      return 1
+    fi
+    if [ ! -f "$file" ]; then
+      print_warn "DNS 配置文件已不存在，未恢复：${file}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    # 关闭 IPv6 之后被改过的文件不覆盖，避免丢掉用户或网络管理服务写入的新配置。
+    if [ -f "$state_dir/${index}.applied" ] && ! cmp -s "$file" "$state_dir/${index}.applied"; then
+      print_warn "${file} 在关闭 IPv6 后已改动，未覆盖；原始内容保留在 ${state_dir}/${index}.original"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    backup_file "$file" || return 1
+    cat "$state_dir/${index}.original" > "$file" || return 1
+    restored=$((restored + 1))
+  done < "$state_dir/manifest"
+  if [ "$restored" -gt 0 ]; then
+    print_ok "已恢复 ${restored} 个 DNS 配置文件中的 IPv6 nameserver。"
+    ipv6_dns_refresh_resolvers || true
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    print_warn "有 ${skipped} 个 DNS 配置未自动恢复，请按上方提示手工处理。"
+    return 0
+  fi
+  ipv6_dns_clear_state || return 1
 }
 
 enable_ipv6_runtime() {
@@ -1224,6 +1484,7 @@ configure_restore_ipv6() {
   restore_ipv6_grub_persistence || return 1
   restore_ipv6_sysctl_config || return 1
   restore_ipv6_ufw || return 1
+  restore_ipv6_dns || return 1
   if kernel_has_ipv6_disable_arg; then
     IPV6_REBOOT_REQUIRED=1
     print_warn "IPv6 禁用配置已撤销；当前内核仍通过 ipv6.disable=1 启动，需要重启服务器才能恢复 IPv6。本脚本不会自动重启。"
@@ -1776,6 +2037,8 @@ print_execution_report() {
     echo "IPv6 默认路由:"
     ip -6 route show default 2>/dev/null || true
   fi
+  echo "生效的 DNS nameserver:"
+  awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf 2>/dev/null || true
   echo
 
   echo "BBR + fq 状态:"
@@ -1806,6 +2069,7 @@ print_execution_report() {
   print_warn "注意: Docker 对外发布的容器端口可能绕过 UFW 规则；部署容器时请额外检查 ports 或 -p 暴露策略。"
   if is_yes "$ENABLE_DISABLE_IPV6"; then
     print_warn "注意: 本脚本已关闭 IPv6；如云厂商网络或应用依赖 IPv6，请先确认不会受影响。"
+    print_warn "注意: DNS 配置中的 IPv6 nameserver 已被移除，只保留 IPv4；执行 --restore-ipv6 会还原。"
     if [ "$IPV6_REBOOT_REQUIRED" -eq 1 ]; then
       print_warn "注意: ipv6.disable=1 已写入 GRUB；请在方便时重启，并在重启后重新运行状态检查。"
     fi
@@ -1864,7 +2128,7 @@ if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     print_section "模拟执行：只恢复 IPv6"
-    echo "撤销 IPv6 禁用配置，恢复 UFW 的 IPv6 支持，重新启用 IPv6 并恢复地址和路由。"
+    echo "撤销 IPv6 禁用配置，恢复 UFW 的 IPv6 支持和被移除的 IPv6 DNS，重新启用 IPv6 并恢复地址和路由。"
     echo "若当前内核使用 ipv6.disable=1 启动，配置恢复后需要重启。"
     exit 0
   fi

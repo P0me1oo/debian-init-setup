@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.1.1`
+- 当前版本：`3.2.0`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -18,10 +18,28 @@
 | `fail2ban` | 安装并启用 Fail2ban，保护 SSH |
 | `journald` | 限制 systemd journal 日志大小 |
 | `timezone` | 设置时区并安装启用 chrony |
-| `ipv6` | 关闭 IPv6 并尝试写入 GRUB 启动参数 |
+| `ipv6` | 关闭 IPv6、清理 DNS 配置中的 IPv6 nameserver，并尝试写入 GRUB 启动参数 |
 | `docker` | 安装 Docker Engine、Buildx 和 Compose 插件 |
 
 脚本不负责配置 ZRAM、swapfile 或 htop。
+
+## 关闭 IPv6 时的 DNS 处理
+
+`ipv6` 模块关闭 IPv6 后，会把 DNS 配置里的 IPv6 nameserver 一起移除，只保留 IPv4 DNS，避免解析器反复尝试已经不通的 IPv6 服务器。处理的文件：
+
+| 文件 | 处理的配置项 |
+| --- | --- |
+| `/etc/systemd/resolved.conf`、`/etc/systemd/resolved.conf.d/*.conf` | `DNS=`、`FallbackDNS=` |
+| `/etc/systemd/network/*.network`、`/etc/systemd/network/*.network.d/*.conf` | `DNS=` |
+| `/etc/resolvconf/resolv.conf.d/head`、`base`、`tail` | `nameserver` |
+| `/etc/network/interfaces`、`/etc/network/interfaces.d/*` | `dns-nameservers`、`dns-nameserver` |
+| `/etc/resolv.conf` | `nameserver` |
+
+- 只改动 DNS 服务器地址，同一文件里的地址、网关、`search`、`options` 和注释行保持原样。`1.1.1.1:53`、`1.1.1.1#cloudflare-dns.com` 这类带端口或 DoT 名称的 IPv4 写法会被保留。
+- 一行里的地址全是 IPv6 时，`DNS=` 和 `FallbackDNS=` 保留键名写成空值（systemd 视为清空该列表），`dns-nameservers` 整行删除。
+- 改完上游配置后会执行 `resolvconf -u`、`networkctl reload` 和重启 `systemd-resolved`（仅在对应命令存在且服务在运行时），让 `/etc/resolv.conf` 重新生成。`/etc/resolv.conf` 是符号链接时不直接改写，交由生成它的服务处理。
+- 移除后如果一条 IPv4 DNS 都不剩，脚本仍然执行移除，并在输出和结果报告中告警。此时该机器无法解析域名，需要手工写入一条 IPv4 nameserver，或执行 `--restore-ipv6` 还原。
+- 不覆盖 NetworkManager 连接配置和 DHCP 客户端的 `supersede` 设置。这些来源下发的 IPv6 DNS 在 IPv6 关闭后一般不再生效；如仍出现 IPv6 nameserver，脚本会在 DNS 校验中告警。
 
 ## 运行前提
 
@@ -178,14 +196,15 @@ bash init_setup.sh --yes --restore-ipv6
 bash init_setup.sh --restore-ipv6 --dry-run
 ```
 
-恢复流程会备份并清理脚本写入的 IPv6 禁用系统参数和 GRUB 启动参数，恢复 UFW 的 IPv6 支持，并在 UFW 已启用时重载现有规则。随后开启各接口的 IPv6，并恢复地址和路由。本版本的 UFW 配置流程会保留已有 IPv6 规则，避免它们在禁用 IPv6 支持时被 UFW 清空；旧版运行时已经丢失的自定义规则仍需从原备份恢复。
+恢复流程会备份并清理脚本写入的 IPv6 禁用系统参数和 GRUB 启动参数，恢复 UFW 的 IPv6 支持，并在 UFW 已启用时重载现有规则。随后写回被移除的 IPv6 DNS，开启各接口的 IPv6，并恢复地址和路由。本版本的 UFW 配置流程会保留已有 IPv6 规则，避免它们在禁用 IPv6 支持时被 UFW 清空；旧版运行时已经丢失的自定义规则仍需从原备份恢复。
 
 - 使用本版本关闭 IPv6 时，会先保存地址、路由和网卡编号。同一次系统启动内、网卡编号未变化时，恢复会使用这份快照；重复关闭不会覆盖第一次保存的数据。
 - 旧版关闭时没有快照，或快照因重启、网卡变化而不再适用时，会尝试从 Debian 的 ifupdown 静态网络配置恢复 IPv6 地址和网关。其他网络管理服务需要按自身配置重新分配地址。
+- DNS 配置按关闭前的原始内容整文件写回。如果某个文件在关闭之后被改动过，脚本不覆盖它，只提示原始内容的保存位置，需要手工处理。
 - 如果当前内核已经通过 `ipv6.disable=1` 启动，脚本会撤销禁用配置并提示重启，不会自动重启服务器。重启后可再次执行恢复命令检查结果。
 - 即时恢复只有在接口开关开启、存在可用的全局地址和默认路由时才报告成功；配置、备份或服务操作失败会返回非零退出码。地址和路由检查不代表已验证外部网络连通性。
 
-IPv6 恢复快照保存在 `/var/backups/debian-init-setup/ipv6-runtime/`，即时恢复验证成功后清理。配置文件备份仍按原有规则保留。恢复失败时根据错误提示处理后，可以重复执行同一命令。
+IPv6 恢复快照保存在 `/var/backups/debian-init-setup/ipv6-runtime/`，即时恢复验证成功后清理。DNS 原始配置保存在 `/var/backups/debian-init-setup/ipv6-dns/`，全部写回后清理。配置文件备份仍按原有规则保留。恢复失败时根据错误提示处理后，可以重复执行同一命令。
 
 ## 备份和日志
 
@@ -219,7 +238,17 @@ python -m unittest discover -s tests -v
 
 `3.1.0` 已在 Debian 12、静态 IPv6、已启用 UFW 的服务器上验证新版关闭后恢复、重复关闭与恢复，以及 `3.0.5` 关闭后由新版恢复。各次恢复后的 IPv6 HTTPS 访问均成功，IPv4 地址和路由、SSH 配置、已有 IPv4/IPv6 防火墙规则通过一致性检查。测试结束后已恢复原始配置。需要重启才能生效的分支通过隔离测试验证，未执行实机重启。
 
+`3.2.0` 的 DNS 处理目前只通过上述回归测试验证，未在实机上验证 `resolvconf -u`、`networkctl reload` 和 `systemd-resolved` 重启后的重新生成结果。
+
 ## 版本记录
+
+### 3.2.0
+
+- 关闭 IPv6 时同步清理 DNS 配置中的 IPv6 nameserver，覆盖 `systemd-resolved`、`systemd-networkd`、`resolvconf`、ifupdown 和 `/etc/resolv.conf`，只保留 IPv4 DNS。
+- 改完上游配置后按需执行 `resolvconf -u`、`networkctl reload` 和重启 `systemd-resolved`，再校验生效的 `/etc/resolv.conf`；没有 IPv4 DNS 时告警并记入结果报告。
+- `--restore-ipv6` 写回被移除的 IPv6 nameserver；关闭之后被改动过的文件不覆盖，只提示原始内容位置。
+- 状态报告增加生效的 DNS nameserver 列表。
+- 补充 DNS 过滤、带端口和 DoT 写法、重复关闭、恢复与不覆盖改动文件的回归测试。
 
 ### 3.1.1
 

@@ -548,6 +548,139 @@ restore_ifupdown_ipv6
         self.assertNotIn("ip -6 address replace", self.calls())
         self.assertNotIn("ip -6 route replace", self.calls())
 
+    def prepare_dns_fixture(self):
+        self.resolv_conf = self.write_fixture(
+            "etc/resolv.conf",
+            "# 测试用解析配置\n"
+            "nameserver 1.1.1.1\n"
+            "nameserver 2606:4700:4700::1111\n"
+            "  nameserver 2001:4860:4860::8888\n"
+            "nameserver 8.8.8.8\n"
+            "search example.com\noptions timeout:2\n",
+        )
+        self.resolved_conf = self.write_fixture(
+            "etc/systemd/resolved.conf",
+            "[Resolve]\n"
+            "#DNS=\n"
+            "DNS=1.1.1.1 2606:4700:4700::1111 1.0.0.1:53\n"
+            "FallbackDNS=2001:4860:4860::8888\n"
+            "DNSStubListener=yes\nDNSSEC=allow-downgrade\n",
+        )
+        self.networkd_conf = self.write_fixture(
+            "etc/systemd/network/10-eth0.network",
+            "[Match]\nName=eth0\n\n[Network]\n"
+            "Address=2001:db8::2/64\nGateway=2001:db8::1\n"
+            "DNS=9.9.9.9\nDNS=2620:fe::fe\n",
+        )
+        self.interfaces = self.write_fixture(
+            "etc/network/interfaces",
+            "iface eth0 inet static\n"
+            "    address 192.0.2.2/24\n"
+            "    dns-nameservers 8.8.8.8 2001:4860:4860::8888\n"
+            "iface eth0 inet6 static\n"
+            "    address 2001:db8::2/64\n"
+            "    dns-nameservers 2001:4860:4860::8844\n",
+        )
+
+    FILTERED_RESOLV_CONF = (
+        "# 测试用解析配置\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        "search example.com\noptions timeout:2\n"
+    )
+
+    def assert_dns_filtered(self):
+        self.assertEqual(self.resolv_conf.read_text(encoding="utf-8"), self.FILTERED_RESOLV_CONF)
+        self.assertEqual(
+            self.resolved_conf.read_text(encoding="utf-8"),
+            "[Resolve]\n#DNS=\nDNS=1.1.1.1 1.0.0.1:53\nFallbackDNS=\n"
+            "DNSStubListener=yes\nDNSSEC=allow-downgrade\n",
+        )
+        self.assertEqual(
+            self.networkd_conf.read_text(encoding="utf-8"),
+            "[Match]\nName=eth0\n\n[Network]\n"
+            "Address=2001:db8::2/64\nGateway=2001:db8::1\nDNS=9.9.9.9\nDNS=\n",
+        )
+        self.assertEqual(
+            self.interfaces.read_text(encoding="utf-8"),
+            "iface eth0 inet static\n"
+            "    address 192.0.2.2/24\n"
+            "    dns-nameservers 8.8.8.8\n"
+            "iface eth0 inet6 static\n"
+            "    address 2001:db8::2/64\n",
+        )
+
+    def test_disable_ipv6_dns_removes_only_ipv6_nameservers(self):
+        self.prepare_dns_fixture()
+        result = self.run_script("configure_ipv6_dns\n")
+        self.assert_dns_filtered()
+        self.assertIn("保留 2 条 IPv4 nameserver", result.stdout)
+
+    def test_disable_ipv6_dns_is_idempotent_and_keeps_the_first_original(self):
+        self.prepare_dns_fixture()
+        original = self.resolv_conf.read_text(encoding="utf-8")
+        self.run_script("configure_ipv6_dns\nconfigure_ipv6_dns\n")
+        self.assert_dns_filtered()
+        state = self.root / "backups" / "ipv6-dns"
+        originals = [path.read_text(encoding="utf-8") for path in state.glob("*.original")]
+        self.assertIn(original, originals)
+        self.assertEqual(len((state / "manifest").read_text(encoding="utf-8").splitlines()), 4)
+
+    def test_disable_ipv6_dns_reports_when_no_ipv4_nameserver_remains(self):
+        self.write_fixture("etc/resolv.conf", "nameserver 2606:4700:4700::1111\nsearch example.com\n")
+        result = self.run_script("configure_ipv6_dns\n", expected=1)
+        self.assertEqual(
+            (self.root / "etc/resolv.conf").read_text(encoding="utf-8"), "search example.com\n")
+        self.assertIn("没有可用的 IPv4 DNS", result.stdout)
+
+    def test_disable_ipv6_module_filters_dns_configuration(self):
+        self.prepare_ipv6_fixture()
+        self.prepare_dns_fixture()
+        result = self.run_script(self.IPV6_IP_MOCK + "TEST_IPV6_NO_ADDRESS=1\nTEST_IPV6_NO_ROUTE=1\n"
+                                 "configure_disable_ipv6\n")
+        self.assert_dns_filtered()
+        self.assertIn("DNS 只保留 IPv4", result.stdout)
+
+    def test_restore_ipv6_dns_returns_removed_nameservers(self):
+        self.prepare_ipv6_fixture()
+        self.prepare_dns_fixture()
+        originals = {path: path.read_text(encoding="utf-8")
+                     for path in (self.resolv_conf, self.resolved_conf, self.networkd_conf, self.interfaces)}
+        result = self.run_script("configure_ipv6_dns\nrestore_ipv6_dns\n")
+        for path, content in originals.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
+        self.assertIn("已恢复 4 个 DNS 配置文件", result.stdout)
+        self.assertFalse((self.root / "backups" / "ipv6-dns").exists())
+
+    def test_restore_ipv6_dns_keeps_files_changed_after_disabling(self):
+        self.prepare_ipv6_fixture()
+        self.prepare_dns_fixture()
+        changed = self.FILTERED_RESOLV_CONF + "nameserver 223.5.5.5\n"
+        result = self.run_script(
+            "configure_ipv6_dns\n"
+            f"printf '%s' {shlex.quote(changed)} > /etc/resolv.conf\n".replace(
+                "/etc/resolv.conf", bash_path(self.root / "etc" / "resolv.conf"))
+            + "restore_ipv6_dns\n")
+        self.assertEqual(self.resolv_conf.read_text(encoding="utf-8"), changed)
+        self.assertIn("在关闭 IPv6 后已改动，未覆盖", result.stdout)
+        self.assertTrue((self.root / "backups" / "ipv6-dns" / "manifest").exists())
+        self.assertEqual(self.interfaces.read_text(encoding="utf-8").count("dns-nameservers"), 2)
+
+    def test_disable_ipv6_dns_tells_ipv6_apart_from_ipv4_with_port(self):
+        self.write_fixture(
+            "etc/systemd/resolved.conf",
+            "[Resolve]\n"
+            "DNS=1.1.1.1#cloudflare-dns.com [2606:4700:4700::1111]:853#cloudflare-dns.com 9.9.9.9:53\n",
+        )
+        self.write_fixture("etc/network/interfaces", "    dns-nameserver 2001:4860:4860::8888\n")
+        self.write_fixture("etc/resolv.conf", "nameserver 1.1.1.1\n")
+        result = self.run_script("configure_ipv6_dns\n")
+        self.assertEqual(
+            (self.root / "etc/systemd/resolved.conf").read_text(encoding="utf-8"),
+            "[Resolve]\nDNS=1.1.1.1#cloudflare-dns.com 9.9.9.9:53\n",
+        )
+        self.assertEqual((self.root / "etc/network/interfaces").read_text(encoding="utf-8"), "")
+        self.assertEqual((self.root / "etc/resolv.conf").read_text(encoding="utf-8"), "nameserver 1.1.1.1\n")
+        self.assertIn("保留 1 条 IPv4 nameserver", result.stdout)
+
     def test_unsafe_log_directory_is_rejected_before_permission_changes(self):
         log_directory = self.root / "logs"
         log_directory.mkdir()
