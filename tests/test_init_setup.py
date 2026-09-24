@@ -993,6 +993,16 @@ configure_ssh_baseline
         self.assertNotIn("致命错误", result.stdout)
         self.run_script("record_soft_error '模拟模块失败'\nexit 7\n", expected=7)
 
+    def test_final_summary_lists_selected_and_skipped_modules(self):
+        result = self.run_script("run_step '安装常用工具' yes :\nrun_step '安装 Docker' no :\n")
+        self.assertIn("已选择模块:\n- 安装常用工具\n已跳过模块:\n- 安装 Docker", result.stdout)
+
+        result = self.run_script("run_step '安装常用工具' yes :\n")
+        self.assertIn("已选择模块:\n- 安装常用工具\n已跳过模块:\n- 无", result.stdout)
+
+        result = self.run_script("run_step '安装 Docker' no :\n")
+        self.assertIn("已选择模块:\n- 无\n已跳过模块:\n- 安装 Docker", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

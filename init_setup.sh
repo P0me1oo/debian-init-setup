@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.2.1"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -71,6 +71,7 @@ RESTORE_IPV6_ONLY=0
 LOCK_FD=""
 
 declare -a SOFT_ERRORS=()
+declare -a SELECTED_STEPS=()
 declare -a SKIPPED_STEPS=()
 declare -a UFW_ALLOWED_SSH_PORTS=()
 declare -a SSH_TRANSACTION_FILES=()
@@ -578,10 +579,20 @@ print_final_summary() {
       fi
     fi
   fi
-  if [ "${#SKIPPED_STEPS[@]}" -gt 0 ]; then
-    echo "已跳过模块:"
+  if [ "${#SELECTED_STEPS[@]}" -gt 0 ] || [ "${#SKIPPED_STEPS[@]}" -gt 0 ]; then
     local step
-    for step in "${SKIPPED_STEPS[@]}"; do echo "- $step"; done
+    echo "已选择模块:"
+    if [ "${#SELECTED_STEPS[@]}" -gt 0 ]; then
+      for step in "${SELECTED_STEPS[@]}"; do echo "- $step"; done
+    else
+      echo "- 无"
+    fi
+    echo "已跳过模块:"
+    if [ "${#SKIPPED_STEPS[@]}" -gt 0 ]; then
+      for step in "${SKIPPED_STEPS[@]}"; do echo "- $step"; done
+    else
+      echo "- 无"
+    fi
   fi
   printf '总计耗时: %d分%02d秒\n' "$elapsed_min" "$elapsed_sec"
 }
@@ -714,6 +725,7 @@ run_step() {
   local title="$1" enabled="$2" func="$3"
   print_section "$title"
   if is_yes "$enabled"; then
+    SELECTED_STEPS+=("$title")
     "$func"
   else
     print_info "已跳过：$title"

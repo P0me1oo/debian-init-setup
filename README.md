@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.2.0`
+- 当前版本：`3.2.1`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -241,6 +241,10 @@ python -m unittest discover -s tests -v
 `3.2.0` 的 DNS 处理目前只通过上述回归测试验证，未在实机上验证 `resolvconf -u`、`networkctl reload` 和 `systemd-resolved` 重启后的重新生成结果。
 
 ## 版本记录
+
+### 3.2.1
+
+- 结束报告分别列出已选择和已跳过的模块。
 
 ### 3.2.0
 
