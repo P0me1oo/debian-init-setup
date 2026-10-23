@@ -185,12 +185,12 @@ ip() {
 
     def test_mode_defaults(self):
         for mode, expected in (
-            ("recommended", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "yes", "ENABLE_NEXTTRACE_MTR": "yes", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "yes", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_DISABLE_IPV6": "no", "ENABLE_DOCKER": "no"}),
-            ("minimal", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_DISABLE_IPV6": "no", "ENABLE_DOCKER": "no"}),
-            ("full", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "yes", "ENABLE_NEXTTRACE_MTR": "yes", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "yes", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_DISABLE_IPV6": "yes", "ENABLE_DOCKER": "yes"}),
-            ("custom", {"ENABLE_SYSTEM_UPDATE": "no", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "no", "ENABLE_SSH_BASELINE": "no", "ENABLE_UFW": "no", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "no", "ENABLE_TIMEZONE": "no", "ENABLE_DISABLE_IPV6": "no", "ENABLE_DOCKER": "no"}),
+            ("recommended", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "yes", "ENABLE_NEXTTRACE_MTR": "yes", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "yes", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_IPV6_DNS": "no", "ENABLE_DOCKER": "no"}),
+            ("minimal", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_IPV6_DNS": "no", "ENABLE_DOCKER": "no"}),
+            ("full", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "yes", "ENABLE_NEXTTRACE_MTR": "yes", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "yes", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_IPV6_DNS": "yes", "ENABLE_DOCKER": "yes"}),
+            ("custom", {"ENABLE_SYSTEM_UPDATE": "no", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "no", "ENABLE_SSH_BASELINE": "no", "ENABLE_UFW": "no", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "no", "ENABLE_TIMEZONE": "no", "ENABLE_IPV6_DNS": "no", "ENABLE_DOCKER": "no"}),
         ):
-            result = self.run_script(f"MODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_DISABLE_IPV6 $ENABLE_DOCKER\"\n")
+            result = self.run_script(f"MODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_IPV6_DNS $ENABLE_DOCKER\"\n")
             self.assertIn(" ".join(expected.values()), result.stdout.splitlines())
 
     def test_removed_swap_and_htop_are_not_referenced(self):
@@ -219,13 +219,13 @@ ip() {
     def test_interactive_custom_no_disables_only_selected_module(self):
         result = self.run_custom_menu([""] * 9 + ["n", ""])
         self.assertEqual(result.stdout.count(": 开启\n"), 10, result.stdout)
-        self.assertIn("关闭 IPv6: 关闭/跳过", result.stdout)
+        self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 开启", result.stdout)
 
     def test_interactive_custom_enter_respects_explicit_disabled_modules(self):
         result = self.run_custom_menu([""] * 11, "--disable", "ipv6,docker")
         self.assertEqual(result.stdout.count(": 开启\n"), 9, result.stdout)
-        self.assertIn("关闭 IPv6: 关闭/跳过", result.stdout)
+        self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 关闭/跳过", result.stdout)
 
     def test_interactive_custom_input_interruption_stops(self):
@@ -247,6 +247,46 @@ ip() {
         self.assertIn("docker=no", result.stdout)
         result = self.run_script("parse_args --mode custom --disable docker --enable docker\napply_mode_defaults\napply_cli_overrides\nprintf 'docker=%s\\n' \"$ENABLE_DOCKER\"\n")
         self.assertIn("docker=yes", result.stdout)
+
+    def test_ipv6_dns_module_accepts_legacy_names_and_skip_options(self):
+        result = self.run_script(r'''
+for name in ipv6-dns ipv6 disable-ipv6; do
+  ENABLE_IPV6_DNS=no
+  set_toggle_by_name yes "$name"
+  printf '%s=%s\n' "$name" "$ENABLE_IPV6_DNS"
+done
+for option in --no-ipv6-dns --no-ipv6 --no-disable-ipv6; do
+  ENABLE_IPV6_DNS=yes
+  parse_args "$option"
+  apply_cli_overrides
+  printf '%s=%s\n' "$option" "$ENABLE_IPV6_DNS"
+done
+''')
+        for name in ("ipv6-dns", "ipv6", "disable-ipv6"):
+            self.assertIn(f"{name}=yes", result.stdout)
+        for option in ("--no-ipv6-dns", "--no-ipv6", "--no-disable-ipv6"):
+            self.assertIn(f"{option}=no", result.stdout)
+
+    def test_ipv6_dns_environment_alias_and_cli_precedence(self):
+        for variables, arguments, state in (
+            ({"ENABLE_DISABLE_IPV6": "yes"}, [], "开启"),
+            ({"ENABLE_DISABLE_IPV6": "yes", "ENABLE_IPV6_DNS": "no"}, [], "关闭/跳过"),
+            ({"ENABLE_IPV6_DNS": "no"}, ["--enable", "ipv6"], "开启"),
+        ):
+            with self.subTest(variables=variables, arguments=arguments):
+                environment = os.environ.copy()
+                for name in ("ENABLE_DISABLE_IPV6", "ENABLE_IPV6_DNS"):
+                    environment.pop(name, None)
+                environment.update(variables)
+                result = subprocess.run(
+                    [self.bash, "--noprofile", "--norc", bash_path(SCRIPT),
+                     "--dry-run", "--mode", "custom", *arguments],
+                    text=True, encoding="utf-8", errors="replace", capture_output=True,
+                    env=environment, cwd=PROJECT_ROOT, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                dns_line = next(line for line in result.stdout.splitlines() if "移除 IPv6 DNS" in line)
+                self.assertTrue(dns_line.endswith(state), result.stdout)
 
     def test_environment_toggles_override_presets_and_cli_wins(self):
         environment = os.environ.copy()
@@ -295,6 +335,54 @@ ENABLE_DOCKER=invalid
         for forbidden in ("apt_install ", "systemctl ", "sysctl --system", "ip -4 "):
             self.assertNotIn(forbidden, self.calls())
         self.assert_ssh_config_unchanged()
+
+    def test_restore_ipv6_dns_entry_changes_only_dns(self):
+        self.prepare_ipv6_fixture(kernel_disabled=True)
+        snapshot = self.prepare_ipv6_snapshot()
+        self.prepare_dns_fixture()
+        originals = {path: path.read_bytes()
+                     for path in (self.resolv_conf, self.resolved_conf, self.networkd_conf, self.interfaces)}
+        network_files = [self.ipv6_sysctl, self.ipv6_grub, self.ipv6_ufw,
+                         *(self.root / "proc/sys/net/ipv6/conf").glob("*/disable_ipv6"),
+                         *snapshot.iterdir()]
+        network_originals = {path: path.read_bytes() for path in network_files}
+        result = self.run_script(r'''
+configure_ipv6_dns
+require_root() { :; }
+prepare_logfile() { :; }
+acquire_run_lock() { :; }
+ENABLE_DOCKER=invalid
+''', main_arguments=["--yes", "--restore-ipv6-dns", "--mode", "full", "--enable", "all"])
+        for path, content in {**originals, **network_originals}.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertIn("IPv6 DNS 恢复结果", result.stdout)
+        self.assertNotIn("需要重启", result.stdout)
+        self.assertFalse((self.root / "backups/ipv6-dns").exists())
+        for forbidden in ("ip ", "sysctl ", "update-grub", "ufw ", "apt_install "):
+            self.assertNotIn(forbidden, self.calls())
+
+    def test_restore_ipv6_dns_dry_run_has_no_side_effects(self):
+        result = self.run_script("", main_arguments=["--restore-ipv6-dns", "--dry-run", "--mode", "full"])
+        self.assertIn("模拟执行：只恢复 IPv6 DNS", result.stdout)
+        self.assertNotIn("安装 Docker", result.stdout)
+        self.assertEqual(self.calls(), "")
+        self.assertFalse((self.root / "init.log").exists())
+        self.assertFalse((self.root / "backups").exists())
+
+    def test_restore_ipv6_dns_rejects_conflicting_maintenance_options(self):
+        for option in ("--restore", "--restore-ipv6", "--check", "--status"):
+            with self.subTest(option=option):
+                result = self.run_script("", expected=2, main_arguments=["--yes", "--restore-ipv6-dns", option])
+                self.assertIn("不能与", result.stdout)
+                self.assertEqual(self.calls(), "")
+
+    def test_restore_ipv6_dns_non_interactive_entry_requires_yes(self):
+        result = self.run_script(
+            "ORIGINAL_STDIN_IS_TTY=0\nORIGINAL_STDOUT_IS_TTY=0\n",
+            expected=2, main_arguments=["--restore-ipv6-dns"],
+        )
+        self.assertIn("没有显式提供 --yes", result.stdout)
+        self.assertEqual(self.calls(), "")
 
     def test_restore_ipv6_dry_run_has_no_system_side_effects(self):
         result = self.run_script("", main_arguments=["--restore-ipv6", "--dry-run", "--mode", "full"])
@@ -438,41 +526,17 @@ configure_restore_ipv6
         self.assertEqual(self.ipv6_ufw.read_text(encoding="utf-8"), "IPV6=yes\nDEFAULT_INPUT_POLICY=DROP\n")
         self.assertEqual(self.calls(), "")
 
-    def test_disable_ipv6_preserves_first_network_snapshot(self):
-        self.prepare_ipv6_fixture()
-        self.run_script(self.IPV6_IP_MOCK + "save_ipv6_runtime_state\nip() { return 99; }\nsave_ipv6_runtime_state\n")
-        snapshot = self.root / "backups/ipv6-runtime"
-        self.assertEqual((snapshot / "addresses").read_text(encoding="utf-8"), "saved-addresses\n")
-        self.assertEqual((snapshot / "routes").read_text(encoding="utf-8"), "saved-routes\n")
-        self.assertEqual(self.calls().splitlines().count("ip -6 address save scope global"), 1)
-
     @unittest.skipUnless(Path("/proc/sys/kernel/random/boot_id").is_file(), "需要 Linux 的 /proc 启动标识")
     def test_ipv6_snapshot_reads_real_proc_boot_id_contents(self):
         self.prepare_ipv6_fixture()
+        self.prepare_ipv6_snapshot(boot_id=Path("/proc/sys/kernel/random/boot_id").read_text())
         boot_id = self.root / "proc/sys/kernel/random/boot_id"
         boot_id.unlink()
         # 使用真正的 /proc 只读文件，覆盖文件大小为 0、实际内容非空的情况。
         boot_id.symlink_to("/proc/sys/kernel/random/boot_id")
-        self.run_script(self.IPV6_IP_MOCK +
-                        "save_ipv6_runtime_state\nsave_ipv6_runtime_state\nrestore_ipv6_network_state\n")
-        self.assertEqual(self.calls().splitlines().count("ip -6 address save scope global"), 1)
+        self.run_script(self.IPV6_IP_MOCK + "restore_ipv6_network_state\n")
         self.assertEqual((self.root / "restored-addresses").read_text(encoding="utf-8"), "saved-addresses\n")
         self.assertEqual((self.root / "restored-routes").read_text(encoding="utf-8"), "saved-routes\n")
-
-    def test_disable_ipv6_snapshot_failure_stops_before_disabling_network(self):
-        self.prepare_ipv6_fixture()
-        original = self.ipv6_grub.read_text(encoding="utf-8")
-        self.run_script(r'''
-ip() {
-  record_call ip "$@"
-  if [ "$*" = '-6 route save table all' ]; then return 1; fi
-  printf 'state\n'
-}
-configure_disable_ipv6
-''', expected=1)
-        self.assertEqual(self.ipv6_grub.read_text(encoding="utf-8"), original)
-        self.assertNotIn("sysctl ", self.calls())
-        self.assertFalse((self.root / "backups/ipv6-runtime/boot-id").exists())
 
     def test_restore_ipv6_does_not_replay_snapshots_after_boot_or_interface_changes(self):
         self.prepare_ipv6_fixture()
@@ -624,20 +688,69 @@ restore_ifupdown_ipv6
         self.assertIn(original, originals)
         self.assertEqual(len((state / "manifest").read_text(encoding="utf-8").splitlines()), 4)
 
-    def test_disable_ipv6_dns_reports_when_no_ipv4_nameserver_remains(self):
-        self.write_fixture("etc/resolv.conf", "nameserver 2606:4700:4700::1111\nsearch example.com\n")
+    def test_ipv6_dns_refuses_changes_without_ipv4_dns(self):
+        self.prepare_dns_fixture()
+        original = "nameserver 2606:4700:4700::1111\nsearch example.com\n"
+        self.resolv_conf.write_text(original, encoding="utf-8")
+        resolved_original = self.resolved_conf.read_bytes()
         result = self.run_script("configure_ipv6_dns\n", expected=1)
-        self.assertEqual(
-            (self.root / "etc/resolv.conf").read_text(encoding="utf-8"), "search example.com\n")
-        self.assertIn("没有可用的 IPv4 DNS", result.stdout)
+        self.assertEqual(self.resolv_conf.read_text(encoding="utf-8"), original)
+        self.assertEqual(self.resolved_conf.read_bytes(), resolved_original)
+        self.assertFalse((self.root / "backups").exists())
+        self.assertIn("没有 IPv4 DNS", result.stdout)
+        self.assertEqual(self.calls(), "")
 
-    def test_disable_ipv6_module_filters_dns_configuration(self):
+    def test_ipv6_dns_checks_resolved_upstream_before_modifying(self):
+        self.prepare_dns_fixture()
+        self.resolv_conf.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
+        original = self.resolved_conf.read_bytes()
+        for response in ("Global: 2606:4700:4700::1111", "Link 2 (eth0): 2001:4860:4860::8888"):
+            with self.subTest(response=response):
+                result = self.run_script(
+                    f"resolvectl() {{ printf '%s\\n' {shlex.quote(response)}; }}\nconfigure_ipv6_dns\n",
+                    expected=1,
+                )
+                self.assertIn("没有 IPv4 DNS", result.stdout)
+                self.assertEqual(self.resolved_conf.read_bytes(), original)
+                self.assertFalse((self.root / "backups").exists())
+        self.run_script(r'''
+resolvectl() { printf 'Global: 2606:4700:4700::1111\nLink 2 (eth0): 1.1.1.1\n'; }
+configure_ipv6_dns
+''')
+        self.assertNotIn("2606:4700:4700::1111", self.resolved_conf.read_text(encoding="utf-8"))
+        self.assertEqual(self.resolv_conf.read_text(encoding="utf-8"), "nameserver 127.0.0.53\n")
+
+    def test_ipv6_dns_preserves_files_when_resolved_upstream_cannot_be_read(self):
+        self.prepare_dns_fixture()
+        self.resolv_conf.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
+        original = self.resolved_conf.read_bytes()
+        self.run_script("resolvectl() { return 1; }\nconfigure_ipv6_dns\n", expected=1)
+        self.assertEqual(self.resolved_conf.read_bytes(), original)
+        self.assertFalse((self.root / "backups").exists())
+
+    def test_ipv6_dns_module_entry_preserves_ipv6_network_configuration(self):
         self.prepare_ipv6_fixture()
         self.prepare_dns_fixture()
-        result = self.run_script(self.IPV6_IP_MOCK + "TEST_IPV6_NO_ADDRESS=1\nTEST_IPV6_NO_ROUTE=1\n"
-                                 "configure_disable_ipv6\n")
+        self.ipv6_ufw.write_text("IPV6=yes\n", encoding="utf-8")
+        settings = list((self.root / "proc/sys/net/ipv6/conf").glob("*/disable_ipv6"))
+        for path in settings:
+            path.write_text("0\n", encoding="utf-8")
+        originals = {path: path.read_bytes()
+                     for path in [self.ipv6_sysctl, self.ipv6_grub, self.ipv6_ufw, *settings]}
+        result = self.run_script(r'''
+require_root() { :; }
+prepare_logfile() { :; }
+acquire_run_lock() { :; }
+check_runtime_environment() { :; }
+print_execution_report() { :; }
+''', main_arguments=["--yes", "--mode", "custom", "--enable", "ipv6-dns"])
         self.assert_dns_filtered()
-        self.assertIn("DNS 只保留 IPv4", result.stdout)
+        self.assertIn("IPv6 网络设置保持原样", result.stdout)
+        for path, content in originals.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse((self.root / "backups/ipv6-runtime").exists())
+        for forbidden in ("ip ", "sysctl ", "update-grub", "ufw ", "apt_install "):
+            self.assertNotIn(forbidden, self.calls())
 
     def test_restore_ipv6_dns_returns_removed_nameservers(self):
         self.prepare_ipv6_fixture()
@@ -650,7 +763,29 @@ restore_ifupdown_ipv6
         self.assertIn("已恢复 4 个 DNS 配置文件", result.stdout)
         self.assertFalse((self.root / "backups" / "ipv6-dns").exists())
 
-    def test_restore_ipv6_dns_keeps_files_changed_after_disabling(self):
+    def test_restore_ipv6_dns_retains_state_when_resolver_refresh_fails(self):
+        self.prepare_dns_fixture()
+        self.run_script(r'''
+configure_ipv6_dns
+systemctl() {
+  record_call systemctl "$@"
+  [ "$*" = 'is-active --quiet systemd-resolved' ]
+}
+restore_ipv6_dns
+''', expected=1)
+        self.assertTrue((self.root / "backups/ipv6-dns/manifest").is_file())
+        self.assertIn("nameserver 2606:4700:4700::1111", self.resolv_conf.read_text(encoding="utf-8"))
+        self.run_script(r'''
+systemctl() {
+  record_call systemctl "$@"
+  [ "$*" = 'is-active --quiet systemd-resolved' ] || [ "$*" = 'try-restart systemd-resolved' ]
+}
+restore_ipv6_dns
+restore_ipv6_dns
+''')
+        self.assertFalse((self.root / "backups/ipv6-dns").exists())
+
+    def test_restore_ipv6_dns_keeps_new_changes_and_allows_partial_retries(self):
         self.prepare_ipv6_fixture()
         self.prepare_dns_fixture()
         changed = self.FILTERED_RESOLV_CONF + "nameserver 223.5.5.5\n"
@@ -658,11 +793,15 @@ restore_ifupdown_ipv6
             "configure_ipv6_dns\n"
             f"printf '%s' {shlex.quote(changed)} > /etc/resolv.conf\n".replace(
                 "/etc/resolv.conf", bash_path(self.root / "etc" / "resolv.conf"))
-            + "restore_ipv6_dns\n")
+            + "restore_ipv6_dns\n", expected=1)
         self.assertEqual(self.resolv_conf.read_text(encoding="utf-8"), changed)
-        self.assertIn("在关闭 IPv6 后已改动，未覆盖", result.stdout)
+        self.assertIn("在 DNS 修改后已改动，未覆盖", result.stdout)
         self.assertTrue((self.root / "backups" / "ipv6-dns" / "manifest").exists())
         self.assertEqual(self.interfaces.read_text(encoding="utf-8").count("dns-nameservers"), 2)
+        self.resolv_conf.write_text(self.FILTERED_RESOLV_CONF, encoding="utf-8", newline="\n")
+        self.run_script("restore_ipv6_dns\n")
+        self.assertIn("nameserver 2606:4700:4700::1111", self.resolv_conf.read_text(encoding="utf-8"))
+        self.assertFalse((self.root / "backups/ipv6-dns").exists())
 
     def test_disable_ipv6_dns_tells_ipv6_apart_from_ipv4_with_port(self):
         self.write_fixture(
@@ -867,7 +1006,7 @@ configure_ssh_baseline
         result = self.run_script('sshd() { printf "port 2222\\n"; }\nprintf "detected=%s\\n" "$(detect_sshd_port_numbers)"\n')
         self.assertIn("detected=2222", result.stdout)
 
-    UFW_SETUP = "ENABLE_SSH_BASELINE=no\nENABLE_DISABLE_IPV6=no\n"
+    UFW_SETUP = "ENABLE_SSH_BASELINE=no\nENABLE_IPV6_DNS=no\n"
 
     def test_ufw_does_not_enable_when_port_is_unknown(self):
         self.run_script(self.UFW_SETUP + "configure_ufw_firewall\n", expected=1)
@@ -887,7 +1026,7 @@ configure_ssh_baseline
 
     def test_ufw_ignores_retired_extra_ports_and_reports_verified_ssh_port(self):
         result = self.run_script(r'''
-ENABLE_DISABLE_IPV6=no
+ENABLE_IPV6_DNS=no
 SSH_READY=1
 SSH_PORT=10721
 UFW_EXTRA_PORTS='80/tcp,443/tcp,8443/tcp'
@@ -898,21 +1037,17 @@ printf 'allowed_ssh=%s\n' "${UFW_ALLOWED_SSH_PORTS[*]}"
         self.assertEqual(rules, ["ufw allow 10721/tcp"])
         self.assertIn("allowed_ssh=10721", result.stdout)
 
-    def test_ufw_keeps_ipv6_rules_while_disabling_ipv6_support(self):
+    def test_ufw_keeps_ipv6_support_when_dns_module_is_selected(self):
         self.write_fixture("etc/default/ufw", "IPV6=yes\n")
         original = "# 已有 IPv6 规则\n-A ufw6-user-input -p tcp --dport 443 -j ACCEPT\n"
         rules = self.write_fixture("etc/ufw/user6.rules", original)
         self.run_script(r'''
-ENABLE_DISABLE_IPV6=yes
+ENABLE_IPV6_DNS=yes
 SSH_READY=1
-ufw() {
-  record_call ufw "$@"
-  : > "$TEST_ROOT/etc/ufw/user6.rules"
-}
 configure_ufw_firewall
 ''')
         self.assertEqual(rules.read_text(encoding="utf-8"), original)
-        self.assertIn("IPV6=no", (self.root / "etc/default/ufw").read_text(encoding="utf-8"))
+        self.assertEqual((self.root / "etc/default/ufw").read_text(encoding="utf-8"), "IPV6=yes\n")
         self.assertIn("ufw --force enable", self.calls())
 
     def test_ufw_failure_retains_ipv6_rules_and_stops_configuration(self):
@@ -920,7 +1055,7 @@ configure_ufw_firewall
         original = "# 已有 IPv6 规则\n-A ufw6-user-input -p tcp --dport 443 -j ACCEPT\n"
         rules = self.write_fixture("etc/ufw/user6.rules", original)
         self.run_script(r'''
-ENABLE_DISABLE_IPV6=no
+ENABLE_IPV6_DNS=no
 SSH_READY=1
 ufw() {
   record_call ufw "$@"

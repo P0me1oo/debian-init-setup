@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="3.2.1"
+SCRIPT_VERSION="4.0.0"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -25,7 +25,6 @@ LAST_ERR_COMMAND=""
 SSH_READY=0
 SSH_SERVICE_RELOADED=0
 IPV6_REBOOT_REQUIRED=0
-IPV6_PERSISTENCE_READY=0
 IPV6_DNS_CHANGED_FILES=0
 INTERACTIVE_MODE="${INTERACTIVE_MODE:-auto}"
 ORIGINAL_STDIN_IS_TTY=0
@@ -34,8 +33,10 @@ ORIGINAL_STDOUT_IS_TTY=0
 [ -t 1 ] && ORIGINAL_STDOUT_IS_TTY=1
 
 # 先保存显式设置的环境变量，再依次应用模式默认值、环境变量和命令行参数。
+# 兼容旧开关；旧名称现在也只控制 DNS 清理。
+ENABLE_IPV6_DNS="${ENABLE_IPV6_DNS:-${ENABLE_DISABLE_IPV6:-}}"
 declare -a MODULE_TOGGLE_NAMES=(
-  ENABLE_SYSTEM_UPDATE ENABLE_COMMON_TOOLS ENABLE_NEXTTRACE_MTR ENABLE_DISABLE_IPV6
+  ENABLE_SYSTEM_UPDATE ENABLE_COMMON_TOOLS ENABLE_NEXTTRACE_MTR ENABLE_IPV6_DNS
   ENABLE_BBR ENABLE_SSH_BASELINE ENABLE_UFW ENABLE_FAIL2BAN ENABLE_JOURNAL_LIMIT
   ENABLE_TIMEZONE ENABLE_DOCKER
 )
@@ -49,7 +50,7 @@ unset module_var
 
 ENABLE_SYSTEM_UPDATE="${ENABLE_SYSTEM_UPDATE:-yes}"
 ENABLE_COMMON_TOOLS="${ENABLE_COMMON_TOOLS:-yes}"
-ENABLE_DISABLE_IPV6="${ENABLE_DISABLE_IPV6:-yes}"
+ENABLE_IPV6_DNS="${ENABLE_IPV6_DNS:-yes}"
 ENABLE_BBR="${ENABLE_BBR:-yes}"
 ENABLE_SSH_BASELINE="${ENABLE_SSH_BASELINE:-yes}"
 ENABLE_UFW="${ENABLE_UFW:-yes}"
@@ -68,6 +69,7 @@ DRY_RUN=0
 STATUS_ONLY=0
 RESTORE_ONLY=0
 RESTORE_IPV6_ONLY=0
+RESTORE_IPV6_DNS_ONLY=0
 LOCK_FD=""
 
 declare -a SOFT_ERRORS=()
@@ -107,13 +109,14 @@ usage() {
 自定义交互默认开启各模块：[Y/n] 回车开启，输入 n 关闭。
 
 模块名:
-  update, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6, docker, all
+  update, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6-dns, docker, all
+  ipv6-dns 只移除 IPv6 DNS，保留 IPv6 联网能力；兼容旧模块名 ipv6。
 
 选项:
   -y, --yes, --non-interactive     不显示交互菜单；非终端执行时必须提供
       --interactive                强制显示交互菜单
       --mode MODE                  模式：recommended、minimal、full、custom
-      --disable a,b,c              关闭模块，例如 --disable docker,ipv6
+      --disable a,b,c              关闭模块，例如 --disable docker,ipv6-dns
       --enable a,b,c               开启模块
       --ssh-port PORT              SSH 端口，默认 10721
       --ssh-key "KEY"              root SSH 公钥
@@ -124,10 +127,12 @@ usage() {
       --dry-run                    显示将执行的模块，不修改系统
       --status                     输出当前状态，不修改系统
       --restore                    恢复最近一次脚本备份的配置
-      --restore-ipv6                只恢复 IPv6，不执行初始化模块
+      --restore-ipv6-dns            只恢复被移除的 IPv6 DNS
+      --restore-ipv6                恢复旧版脚本关闭的 IPv6
       --replace-existing-runtime  允许 Docker 模块替换已有容器运行时
       --no-journal-limit           不配置 systemd journal 大小限制
       --no-nexttrace-mtr           不安装 NextTrace 和 mtr
+      --no-ipv6-dns                不修改 DNS 配置
   -h, --help                       显示帮助
   -V, --version                    显示版本
 
@@ -136,9 +141,9 @@ usage() {
   bash init_setup.sh --mode recommended
   bash init_setup.sh --yes --mode minimal
   bash init_setup.sh --yes --mode full
-  bash init_setup.sh --yes --mode recommended --disable ipv6,docker
+  bash init_setup.sh --yes --mode custom --enable ipv6-dns
   bash init_setup.sh --check
-  bash init_setup.sh --yes --restore-ipv6
+  bash init_setup.sh --yes --restore-ipv6-dns
 USAGE
 }
 
@@ -208,7 +213,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=yes
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
-      ENABLE_DISABLE_IPV6=no
+      ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       ;;
     minimal)
@@ -221,7 +226,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=no
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
-      ENABLE_DISABLE_IPV6=no
+      ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       ;;
     full)
@@ -234,7 +239,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=yes
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
-      ENABLE_DISABLE_IPV6=yes
+      ENABLE_IPV6_DNS=yes
       ENABLE_DOCKER=yes
       ;;
     custom)
@@ -247,7 +252,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=no
       ENABLE_JOURNAL_LIMIT=no
       ENABLE_TIMEZONE=no
-      ENABLE_DISABLE_IPV6=no
+      ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       if should_prompt; then
         set_toggle_by_name yes all
@@ -262,11 +267,11 @@ set_toggle_by_name() {
   name="${name//_/-}"
   case "$name" in
     all)
-      ENABLE_SYSTEM_UPDATE="$value"; ENABLE_COMMON_TOOLS="$value"; ENABLE_NEXTTRACE_MTR="$value"; ENABLE_DISABLE_IPV6="$value"; ENABLE_BBR="$value"; ENABLE_SSH_BASELINE="$value"; ENABLE_UFW="$value"; ENABLE_FAIL2BAN="$value"; ENABLE_JOURNAL_LIMIT="$value"; ENABLE_TIMEZONE="$value"; ENABLE_DOCKER="$value" ;;
+      ENABLE_SYSTEM_UPDATE="$value"; ENABLE_COMMON_TOOLS="$value"; ENABLE_NEXTTRACE_MTR="$value"; ENABLE_IPV6_DNS="$value"; ENABLE_BBR="$value"; ENABLE_SSH_BASELINE="$value"; ENABLE_UFW="$value"; ENABLE_FAIL2BAN="$value"; ENABLE_JOURNAL_LIMIT="$value"; ENABLE_TIMEZONE="$value"; ENABLE_DOCKER="$value" ;;
     update|upgrade|system-update) ENABLE_SYSTEM_UPDATE="$value" ;;
     tools|common-tools) ENABLE_COMMON_TOOLS="$value" ;;
     nexttrace-mtr|nexttrace|mtr|trace-tools|net-trace|network-trace) ENABLE_NEXTTRACE_MTR="$value" ;;
-    ipv6|disable-ipv6) ENABLE_DISABLE_IPV6="$value" ;;
+    ipv6-dns|ipv6|disable-ipv6) ENABLE_IPV6_DNS="$value" ;;
     bbr|bbr-fq) ENABLE_BBR="$value" ;;
     ssh|sshd|ssh-baseline) ENABLE_SSH_BASELINE="$value" ;;
     ufw|firewall) ENABLE_UFW="$value" ;;
@@ -307,11 +312,12 @@ parse_args() {
       --status) STATUS_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --restore) RESTORE_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --restore-ipv6) RESTORE_IPV6_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
+      --restore-ipv6-dns) RESTORE_IPV6_DNS_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --replace-existing-runtime) REPLACE_EXISTING_RUNTIME=1; shift ;;
       --no-update|--no-upgrade) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(update); shift ;;
       --no-tools) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(tools); shift ;;
       --no-nexttrace-mtr|--no-trace-tools|--no-net-trace) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(nexttrace-mtr); shift ;;
-      --no-ipv6|--no-disable-ipv6) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ipv6); shift ;;
+      --no-ipv6-dns|--no-ipv6|--no-disable-ipv6) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ipv6-dns); shift ;;
       --no-bbr) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(bbr); shift ;;
       --no-ssh) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ssh); shift ;;
       --no-ufw|--no-firewall) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ufw); shift ;;
@@ -483,7 +489,7 @@ prompt_configuration() {
   prompt_yes_no ENABLE_FAIL2BAN "启用 Fail2ban" || return 1
   prompt_yes_no ENABLE_JOURNAL_LIMIT "限制 systemd journal 最大占用为 ${JOURNAL_MAX_USE}" || return 1
   prompt_yes_no ENABLE_TIMEZONE "设置系统时区为 ${TARGET_TIMEZONE}，并安装启用 chrony 做时间同步" || return 1
-  prompt_yes_no ENABLE_DISABLE_IPV6 "关闭 IPv6" || return 1
+  prompt_yes_no ENABLE_IPV6_DNS "移除 IPv6 DNS" || return 1
   prompt_yes_no ENABLE_DOCKER "安装 Docker Engine 与 Docker Compose" || return 1
 }
 
@@ -493,10 +499,10 @@ prompt_mode_selection() {
   print_section "0) 选择运行模式"
   echo "1) 推荐模式"
   echo "   默认启用：系统更新、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制和时间同步"
-  echo "   默认跳过：关闭 IPv6、安装 Docker"
+  echo "   默认跳过：移除 IPv6 DNS、安装 Docker"
   echo "2) 精简模式"
   echo "   默认启用：系统更新、BBR + fq、SSH、防火墙、日志限制和时间同步"
-  echo "   默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、关闭 IPv6、安装 Docker"
+  echo "   默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker"
   echo "3) 完整模式"
   echo "   默认启用：全部模块"
   echo "4) 自定义模式：逐项选择模块"
@@ -531,7 +537,7 @@ print_config_summary() {
   printf 'Fail2ban: %s\n' "$(state_text "$ENABLE_FAIL2BAN")"
   printf 'systemd journal 大小限制: %s\n' "$(state_text "$ENABLE_JOURNAL_LIMIT")"
   printf '系统时区 + chrony 时间同步: %s\n' "$(state_text "$ENABLE_TIMEZONE")"
-  printf '关闭 IPv6: %s\n' "$(state_text "$ENABLE_DISABLE_IPV6")"
+  printf '移除 IPv6 DNS: %s\n' "$(state_text "$ENABLE_IPV6_DNS")"
   printf 'Docker: %s\n' "$(state_text "$ENABLE_DOCKER")"
   printf '运行模式: %s\n' "$MODE"
   echo "SSH_PORT: ${SSH_PORT}"
@@ -552,7 +558,9 @@ print_final_summary() {
   elapsed_sec="$((elapsed_sec % 60))"
 
   echo
-  if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
+  if [ "$RESTORE_IPV6_DNS_ONLY" -eq 1 ]; then
+    print_section "IPv6 DNS 恢复结果"
+  elif [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
     print_section "IPv6 恢复结果"
   else
     print_section "10) 简短结果报告"
@@ -811,79 +819,6 @@ ipv6_snapshot_matches_boot() {
   [ "$(<"$saved_boot_id")" = "$(</proc/sys/kernel/random/boot_id)" ]
 }
 
-save_ipv6_runtime_state() {
-  local state_dir="${BACKUP_ROOT}/ipv6-runtime"
-  command -v ip >/dev/null 2>&1 || { print_err "缺少 ip 命令，无法保存 IPv6 地址和路由，已停止关闭 IPv6。"; return 1; }
-  [ -d /proc/sys/net/ipv6/conf ] || return 0
-  kernel_has_ipv6_disable_arg && return 0
-  # 重复关闭时保留第一次的网络状态，防止用空地址覆盖可恢复的数据。
-  if ipv6_snapshot_matches_boot; then
-    if [ ! -r "$state_dir/addresses" ] || [ ! -r "$state_dir/routes" ] || [ ! -r "$state_dir/interfaces" ]; then
-      print_err "已有 IPv6 网络状态备份不完整，已停止关闭 IPv6：${state_dir}"
-      return 1
-    fi
-    return 0
-  fi
-  [ -r /proc/sys/kernel/random/boot_id ] || { print_err "无法读取本次启动标识，已停止关闭 IPv6。"; return 1; }
-  install -d -m 0700 "$state_dir" || return 1
-  ipv6_interface_map > "$state_dir/interfaces" || return 1
-  ip -6 address save scope global > "$state_dir/addresses" || return 1
-  ip -6 route save table all > "$state_dir/routes" || return 1
-  cp -- /proc/sys/kernel/random/boot_id "$state_dir/boot-id" || return 1
-  chmod 0600 "$state_dir/addresses" "$state_dir/routes" "$state_dir/interfaces" "$state_dir/boot-id" || return 1
-  print_ok "已保存 IPv6 地址和路由，供 --restore-ipv6 恢复。"
-}
-
-write_ipv6_sysctl_config() {
-  backup_file "/etc/sysctl.d/99-disable-ipv6.conf" || return 1
-  cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOF_IPV6 || return 1
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF_IPV6
-  chmod 0644 /etc/sysctl.d/99-disable-ipv6.conf
-}
-
-disable_ipv6_runtime() {
-  local setting iface failed_interfaces=""
-
-  if kernel_has_ipv6_disable_arg; then
-    print_info "内核已通过 ipv6.disable=1 关闭 IPv6。"
-    return 0
-  fi
-
-  if [ ! -d /proc/sys/net/ipv6/conf ]; then
-    print_info "内核未提供 IPv6 接口配置，当前无需额外关闭。"
-    return 0
-  fi
-
-  # 先设置全局和新接口默认值，再逐个关闭现有接口，避免网络管理器留下单独启用的网卡。
-  for setting in /proc/sys/net/ipv6/conf/all/disable_ipv6 /proc/sys/net/ipv6/conf/default/disable_ipv6; do
-    [ -e "$setting" ] || continue
-    if ! printf '1\n' > "$setting"; then
-      iface="${setting#/proc/sys/net/ipv6/conf/}"
-      iface="${iface%/disable_ipv6}"
-      failed_interfaces="${failed_interfaces}${failed_interfaces:+,}${iface}"
-    fi
-  done
-
-  for setting in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
-    [ -e "$setting" ] || continue
-    iface="${setting#/proc/sys/net/ipv6/conf/}"
-    iface="${iface%/disable_ipv6}"
-    case "$iface" in all|default) continue ;; esac
-    if ! printf '1\n' > "$setting"; then
-      failed_interfaces="${failed_interfaces}${failed_interfaces:+,}${iface}"
-    fi
-  done
-
-  if [ -n "$failed_interfaces" ]; then
-    print_warn "以下接口无法立即关闭 IPv6：${failed_interfaces}"
-    return 1
-  fi
-  return 0
-}
-
 grub_config_has_ipv6_disable_arg() {
   local file="${1:-/etc/default/grub}"
   [ -f "$file" ] || return 1
@@ -892,51 +827,8 @@ grub_config_has_ipv6_disable_arg() {
        END { exit !found }' "$file"
 }
 
-configure_ipv6_grub_persistence() {
-  local msg
-
-  if [ ! -f /etc/default/grub ] || ! command -v update-grub >/dev/null 2>&1; then
-    if kernel_has_ipv6_disable_arg; then
-      IPV6_PERSISTENCE_READY=1
-      print_ok "当前启动器已经传入 ipv6.disable=1，IPv6 内核启动参数已生效。"
-      return 0
-    fi
-    msg="未检测到可管理的 GRUB 配置；当前已通过 sysctl 关闭 IPv6，但无法保证其他启动器或网络管理器重启后不会重新启用。"
-    print_warn "$msg"
-    record_soft_error "$msg"
-    return 1
-  fi
-
-  if ! grub_config_has_ipv6_disable_arg; then
-    backup_file "/etc/default/grub" || return 1
-    cat >> /etc/default/grub <<'EOF_GRUB_IPV6' || return 1
-
-# init-setup：在内核启动阶段彻底关闭 IPv6，避免网络管理器重新启用具体接口。
-GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX:+${GRUB_CMDLINE_LINUX} }ipv6.disable=1"
-EOF_GRUB_IPV6
-    print_info "已将 ipv6.disable=1 写入 GRUB 内核参数。"
-  else
-    print_info "GRUB 已包含 ipv6.disable=1，跳过重复写入。"
-  fi
-
-  if ! update-grub >/dev/null; then
-    msg="update-grub 执行失败；IPv6 已在当前运行时关闭，但内核启动参数尚未可靠更新。"
-    print_warn "$msg"
-    record_soft_error "$msg"
-    return 1
-  fi
-
-  IPV6_PERSISTENCE_READY=1
-  if kernel_has_ipv6_disable_arg; then
-    print_ok "IPv6 内核启动参数已生效。"
-  else
-    IPV6_REBOOT_REQUIRED=1
-    print_ok "IPv6 内核启动参数已更新，重启后完全生效。"
-  fi
-  return 0
-}
-
 # 只处理 DNS 服务器地址：nameserver 行、systemd 的 DNS=/FallbackDNS= 和 ifupdown 的 dns-nameservers。
+# shellcheck disable=SC2016
 IPV6_DNS_FILTER_AWK='
 function is_ipv6_address(token,   colons) {
   sub(/#.*$/, "", token)
@@ -1020,7 +912,7 @@ ipv6_dns_config_targets() {
 }
 
 ipv6_dns_apply_filtered() {
-  # 记录改动前后的内容，供 --restore-ipv6 判断文件是否仍是脚本写入的版本。
+  # 记录改动前后的内容，供恢复时判断文件是否仍是脚本写入的版本。
   local file="$1" filtered="$2" state_dir="${BACKUP_ROOT}/ipv6-dns" index="" count=0
   install -d -m 0700 "$state_dir" || return 1
   if [ -f "$state_dir/manifest" ]; then
@@ -1111,11 +1003,35 @@ verify_ipv6_dns_config() {
     print_warn "$msg"; record_soft_error "$msg"; issues=1
   fi
   if [ "$ipv4_count" -eq 0 ]; then
-    msg="当前没有可用的 IPv4 DNS，域名解析将无法工作；请手工写入一条 IPv4 nameserver 或执行 --restore-ipv6 还原。"
+    msg="当前没有 IPv4 DNS，域名解析可能无法工作；请配置 IPv4 nameserver 或执行 --restore-ipv6-dns 还原。"
     print_warn "$msg"; record_soft_error "$msg"; issues=1
   fi
   [ "$issues" -eq 0 ] || return 1
   print_ok "DNS 校验通过：保留 ${ipv4_count} 条 IPv4 nameserver，无 IPv6 nameserver。"
+}
+
+require_ipv4_dns() {
+  local resolvers
+  if [ ! -r /etc/resolv.conf ]; then
+    print_err "无法读取 /etc/resolv.conf，已停止修改 DNS。"
+    return 1
+  fi
+  resolvers="$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)" || return 1
+  # resolved 的本地 IPv4 地址不能证明上游还有 IPv4 DNS。
+  if printf '%s\n' "$resolvers" | grep -Eq '^127[.]0[.]0[.](53|54)$'; then
+    if ! command -v resolvectl >/dev/null 2>&1 || ! resolvers="$(resolvectl dns)"; then
+      print_err "无法读取 systemd-resolved 的上游 DNS，已停止修改 DNS。"
+      return 1
+    fi
+    resolvers="$(printf '%s\n' "$resolvers" | sed -E 's/^[^:]*:[[:space:]]*//')"
+  fi
+  if ! printf '%s\n' "$resolvers" | awk '
+    { for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+([:%#].*)?$/) found=1 }
+    END { exit !found }
+  '; then
+    print_err "当前配置中没有 IPv4 DNS，已停止修改；请先配置可用的 IPv4 DNS。"
+    return 1
+  fi
 }
 
 configure_ipv6_dns() {
@@ -1126,10 +1042,13 @@ configure_ipv6_dns() {
     print_warn "$msg"; record_soft_error "$msg"
     return 1
   fi
+  require_ipv4_dns || return 1
   targets="$(ipv6_dns_config_targets)" || return 1
   if [ -n "$targets" ]; then
     while IFS=$'\t' read -r style file; do
-      [ -n "$style" ] && [ -n "$file" ] || continue
+      if [ -z "$style" ] || [ -z "$file" ]; then
+        continue
+      fi
       filter_ipv6_dns_file "$style" "$file" || failed=1
     done <<< "$targets"
   fi
@@ -1143,63 +1062,8 @@ configure_ipv6_dns() {
     print_info "DNS 配置中没有 IPv6 nameserver，无需改动。"
   fi
   verify_ipv6_dns_config || failed=1
-  [ "$failed" -eq 0 ]
-}
-
-verify_ipv6_runtime_disabled() {
-  local setting iface value global_addresses default_routes issues=""
-
-  if [ -d /proc/sys/net/ipv6/conf ]; then
-    for setting in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
-      [ -e "$setting" ] || continue
-      iface="${setting#/proc/sys/net/ipv6/conf/}"
-      iface="${iface%/disable_ipv6}"
-      case "$iface" in all|default) continue ;; esac
-      value="$(<"$setting")"
-      if [ "$value" != "1" ]; then
-        issues="${issues}${issues:+；}${iface}.disable_ipv6=${value}"
-      fi
-    done
-  fi
-
-  if command -v ip >/dev/null 2>&1; then
-    global_addresses="$(ip -6 -o address show scope global 2>/dev/null || true)"
-    default_routes="$(ip -6 route show default 2>/dev/null || true)"
-    [ -z "$global_addresses" ] || issues="${issues}${issues:+；}仍有全局 IPv6 地址"
-    [ -z "$default_routes" ] || issues="${issues}${issues:+；}仍有 IPv6 默认路由"
-  else
-    issues="${issues}${issues:+；}缺少 ip 命令，无法校验 IPv6 地址和路由"
-  fi
-
-  if [ -n "$issues" ]; then
-    print_warn "IPv6 运行时状态未完全关闭：${issues}"
-    return 1
-  fi
-
-  print_ok "IPv6 运行时校验通过：所有现有接口均已关闭，且没有全局 IPv6 地址或默认路由。"
-  return 0
-}
-
-configure_disable_ipv6() {
-  local runtime_ok=1 persistence_ok=1 dns_ok=1 msg
-
-  save_ipv6_runtime_state || return 1
-  write_ipv6_sysctl_config || return 1
-  disable_ipv6_runtime || runtime_ok=0
-  configure_ipv6_grub_persistence || persistence_ok=0
-  configure_ipv6_dns || dns_ok=0
-  verify_ipv6_runtime_disabled || runtime_ok=0
-
-  if [ "$runtime_ok" -eq 0 ]; then
-    msg="IPv6 未能在所有现有接口上完全关闭，请检查网络管理服务和上方校验结果。"
-    record_soft_error "$msg"
-  elif [ "$persistence_ok" -eq 1 ] && [ "$dns_ok" -eq 1 ]; then
-    print_ok "IPv6 当前运行时已关闭，DNS 只保留 IPv4，持久化配置已完成。"
-  elif [ "$dns_ok" -eq 0 ]; then
-    print_warn "IPv6 当前运行时已关闭，但 DNS 配置未完全处理。"
-  else
-    print_warn "IPv6 当前运行时已关闭，但启动阶段持久化配置未完全完成。"
-  fi
+  [ "$failed" -eq 0 ] || return 1
+  print_ok "DNS 修改完成，IPv6 网络设置保持原样。"
 }
 
 apply_ipv6_config_restore() {
@@ -1329,9 +1193,14 @@ ipv6_dns_clear_state() {
 
 restore_ipv6_dns() {
   local state_dir="${BACKUP_ROOT}/ipv6-dns" index file restored=0 skipped=0
-  [ -f "$state_dir/manifest" ] || return 0
+  if [ ! -f "$state_dir/manifest" ]; then
+    print_info "没有待恢复的 IPv6 DNS 配置。"
+    return 0
+  fi
   while IFS=$'\t' read -r index file; do
-    [ -n "$index" ] && [ -n "$file" ] || continue
+    if [ -z "$index" ] || [ -z "$file" ]; then
+      continue
+    fi
     if [ ! -f "$state_dir/${index}.original" ]; then
       print_err "DNS 配置备份不完整：${state_dir}/${index}.original"
       return 1
@@ -1341,9 +1210,12 @@ restore_ipv6_dns() {
       skipped=$((skipped + 1))
       continue
     fi
-    # 关闭 IPv6 之后被改过的文件不覆盖，避免丢掉用户或网络管理服务写入的新配置。
+    # 已恢复的文件允许重复执行；用户或网络服务写入的新配置不覆盖。
+    if cmp -s "$file" "$state_dir/${index}.original"; then
+      continue
+    fi
     if [ -f "$state_dir/${index}.applied" ] && ! cmp -s "$file" "$state_dir/${index}.applied"; then
-      print_warn "${file} 在关闭 IPv6 后已改动，未覆盖；原始内容保留在 ${state_dir}/${index}.original"
+      print_warn "${file} 在 DNS 修改后已改动，未覆盖；原始内容保留在 ${state_dir}/${index}.original"
       skipped=$((skipped + 1))
       continue
     fi
@@ -1353,11 +1225,12 @@ restore_ipv6_dns() {
   done < "$state_dir/manifest"
   if [ "$restored" -gt 0 ]; then
     print_ok "已恢复 ${restored} 个 DNS 配置文件中的 IPv6 nameserver。"
-    ipv6_dns_refresh_resolvers || true
   fi
+  # 刷新失败时保留记录，下次即使文件已写回也能重试刷新。
+  ipv6_dns_refresh_resolvers || return 1
   if [ "$skipped" -gt 0 ]; then
-    print_warn "有 ${skipped} 个 DNS 配置未自动恢复，请按上方提示手工处理。"
-    return 0
+    print_err "有 ${skipped} 个 DNS 配置未自动恢复，请按上方提示手工处理后重试。"
+    return 1
   fi
   ipv6_dns_clear_state || return 1
 }
@@ -1775,10 +1648,6 @@ configure_ufw_firewall() {
       return 1
     fi
   fi
-  if is_yes "$ENABLE_DISABLE_IPV6" && [ -f /etc/default/ufw ]; then
-    backup_file /etc/default/ufw || return 1
-    sed -ri 's/^IPV6=.*/IPV6=no/' /etc/default/ufw || return 1
-  fi
   run_ufw_preserving_ipv6_rules default deny incoming || return 1
   run_ufw_preserving_ipv6_rules default allow outgoing || return 1
   for port in "${ssh_ports[@]}"; do run_ufw_preserving_ipv6_rules allow "${port}/tcp" || return 1; done
@@ -2029,10 +1898,8 @@ print_execution_report() {
   echo "IPv6 状态:"
   if kernel_has_ipv6_disable_arg; then
     echo "内核启动参数: ipv6.disable=1（已生效）"
-  elif [ "$IPV6_PERSISTENCE_READY" -eq 1 ]; then
-    echo "内核启动参数: ipv6.disable=1（已写入，等待重启）"
   else
-    echo "内核启动参数: 未确认持久化"
+    echo "内核启动参数: 未通过 ipv6.disable=1 禁用"
   fi
   if [ -d /proc/sys/net/ipv6/conf ]; then
     local ipv6_setting ipv6_iface
@@ -2079,12 +1946,8 @@ print_execution_report() {
   echo
   print_warn "注意: 跳过某模块只代表本次不改动；不会自动恢复该模块以前写入过的系统配置。"
   print_warn "注意: Docker 对外发布的容器端口可能绕过 UFW 规则；部署容器时请额外检查 ports 或 -p 暴露策略。"
-  if is_yes "$ENABLE_DISABLE_IPV6"; then
-    print_warn "注意: 本脚本已关闭 IPv6；如云厂商网络或应用依赖 IPv6，请先确认不会受影响。"
-    print_warn "注意: DNS 配置中的 IPv6 nameserver 已被移除，只保留 IPv4；执行 --restore-ipv6 会还原。"
-    if [ "$IPV6_REBOOT_REQUIRED" -eq 1 ]; then
-      print_warn "注意: ipv6.disable=1 已写入 GRUB；请在方便时重启，并在重启后重新运行状态检查。"
-    fi
+  if [ "$IPV6_DNS_CHANGED_FILES" -gt 0 ]; then
+    print_info "本次已修改 ${IPV6_DNS_CHANGED_FILES} 个 DNS 配置文件；执行 --restore-ipv6-dns 可恢复。"
   fi
   if [ "$report_mode" = "status" ]; then
     print_ok "状态检查完成"
@@ -2112,7 +1975,7 @@ print_dry_run() {
     "6) 安装并配置 Fail2ban" \
     "6.5) 限制 systemd journal 日志大小" \
     "7) 设置系统时区并安装启用 chrony" \
-    "7.4) 关闭 IPv6" \
+    "7.4) 移除 IPv6 DNS" \
     "8) 安装 Docker Engine 与 Docker Compose"; do
     case "$title" in
       "1)"*) enabled="$ENABLE_SYSTEM_UPDATE" ;;
@@ -2124,7 +1987,7 @@ print_dry_run() {
       "6) 安装"*) enabled="$ENABLE_FAIL2BAN" ;;
       "6.5)"*) enabled="$ENABLE_JOURNAL_LIMIT" ;;
       "7)"*) enabled="$ENABLE_TIMEZONE" ;;
-      "7.4)"*) enabled="$ENABLE_DISABLE_IPV6" ;;
+      "7.4)"*) enabled="$ENABLE_IPV6_DNS" ;;
       "8)"*) enabled="$ENABLE_DOCKER" ;;
     esac
     printf '%-42s %s\n' "$title" "$(state_text "$enabled")"
@@ -2133,15 +1996,21 @@ print_dry_run() {
 
 parse_args "$@"
 require_explicit_non_interactive
-if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
-  if [ "$RESTORE_ONLY" -eq 1 ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$STATUS_ONLY" -eq 1 ]; then
-    print_err "--restore-ipv6 不能与 --restore、--check 或 --status 同时使用。"
+if [ "$RESTORE_IPV6_ONLY" -eq 1 ] || [ "$RESTORE_IPV6_DNS_ONLY" -eq 1 ]; then
+  if [ "$RESTORE_ONLY" -eq 1 ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$STATUS_ONLY" -eq 1 ] ||
+     { [ "$RESTORE_IPV6_ONLY" -eq 1 ] && [ "$RESTORE_IPV6_DNS_ONLY" -eq 1 ]; }; then
+    print_err "--restore-ipv6 和 --restore-ipv6-dns 不能与其他恢复参数、--check 或 --status 同时使用。"
     exit 2
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    print_section "模拟执行：只恢复 IPv6"
-    echo "撤销 IPv6 禁用配置，恢复 UFW 的 IPv6 支持和被移除的 IPv6 DNS，重新启用 IPv6 并恢复地址和路由。"
-    echo "若当前内核使用 ipv6.disable=1 启动，配置恢复后需要重启。"
+    if [ "$RESTORE_IPV6_DNS_ONLY" -eq 1 ]; then
+      print_section "模拟执行：只恢复 IPv6 DNS"
+      echo "写回被移除的 IPv6 DNS 并刷新解析服务，IPv6 网络设置保持原样。"
+    else
+      print_section "模拟执行：只恢复 IPv6"
+      echo "撤销旧版脚本的 IPv6 禁用配置，恢复 UFW 的 IPv6 支持和被移除的 IPv6 DNS，重新启用 IPv6 并恢复地址和路由。"
+      echo "若当前内核使用 ipv6.disable=1 启动，配置恢复后需要重启。"
+    fi
     exit 0
   fi
   require_root
@@ -2150,8 +2019,13 @@ if [ "$RESTORE_IPV6_ONLY" -eq 1 ]; then
   exec > >(tee -a "$LOGFILE") 2>&1
   trap 'on_err ${LINENO} "$BASH_COMMAND"' ERR
   trap 'on_exit $?' EXIT
-  print_section "只恢复 IPv6"
-  configure_restore_ipv6
+  if [ "$RESTORE_IPV6_DNS_ONLY" -eq 1 ]; then
+    print_section "只恢复 IPv6 DNS"
+    restore_ipv6_dns
+  else
+    print_section "只恢复 IPv6"
+    configure_restore_ipv6
+  fi
   exit $?
 fi
 normalize_all_booleans
@@ -2211,7 +2085,7 @@ run_step "5) 安装并配置 UFW 防火墙" "$ENABLE_UFW" configure_ufw_firewall
 run_step "6) 安装并配置 Fail2ban" "$ENABLE_FAIL2BAN" configure_fail2ban
 run_step "6.5) 限制 systemd journal 日志大小" "$ENABLE_JOURNAL_LIMIT" configure_journald_limit
 run_step "7) 设置系统时区并安装启用 chrony" "$ENABLE_TIMEZONE" configure_timezone
-run_step "7.4) 关闭 IPv6" "$ENABLE_DISABLE_IPV6" configure_disable_ipv6
+run_step "7.4) 移除 IPv6 DNS" "$ENABLE_IPV6_DNS" configure_ipv6_dns
 run_step "8) 安装 Docker Engine 与 Docker Compose" "$ENABLE_DOCKER" install_docker_engine
 
 print_section "9) 输出执行结果"

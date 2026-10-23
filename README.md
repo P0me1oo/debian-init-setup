@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`3.2.1`
+- 当前版本：`4.0.0`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -18,14 +18,22 @@
 | `fail2ban` | 安装并启用 Fail2ban，保护 SSH |
 | `journald` | 限制 systemd journal 日志大小 |
 | `timezone` | 设置时区并安装启用 chrony |
-| `ipv6` | 关闭 IPv6、清理 DNS 配置中的 IPv6 nameserver，并尝试写入 GRUB 启动参数 |
+| `ipv6-dns` | 只移除 DNS 配置中的 IPv6 nameserver，保留 IPv6 联网能力；兼容旧模块名 `ipv6` |
 | `docker` | 安装 Docker Engine、Buildx 和 Compose 插件 |
 
 脚本不负责配置 ZRAM、swapfile 或 htop。
 
-## 关闭 IPv6 时的 DNS 处理
+## 只移除 IPv6 DNS
 
-`ipv6` 模块关闭 IPv6 后，会把 DNS 配置里的 IPv6 nameserver 一起移除，只保留 IPv4 DNS，避免解析器反复尝试已经不通的 IPv6 服务器。处理的文件：
+`ipv6-dns` 模块只移除 IPv6 DNS 服务器地址，保留 IPv4 DNS。IPv6 接口开关、地址、路由、系统参数、GRUB 和 UFW 的 IPv6 支持均保持原样。通过 IPv4 DNS 仍可查询域名的 IPv6 地址（AAAA 记录），因此程序仍能使用 IPv6 联网；此模块不设置 IPv4 访问优先级。
+
+只执行 DNS 修改，以 root 身份运行：
+
+```bash
+bash init_setup.sh --yes --mode custom --enable ipv6-dns
+```
+
+推荐和精简模式默认跳过此模块，完整模式默认启用。处理的文件：
 
 | 文件 | 处理的配置项 |
 | --- | --- |
@@ -38,8 +46,9 @@
 - 只改动 DNS 服务器地址，同一文件里的地址、网关、`search`、`options` 和注释行保持原样。`1.1.1.1:53`、`1.1.1.1#cloudflare-dns.com` 这类带端口或 DoT 名称的 IPv4 写法会被保留。
 - 一行里的地址全是 IPv6 时，`DNS=` 和 `FallbackDNS=` 保留键名写成空值（systemd 视为清空该列表），`dns-nameservers` 整行删除。
 - 改完上游配置后会执行 `resolvconf -u`、`networkctl reload` 和重启 `systemd-resolved`（仅在对应命令存在且服务在运行时），让 `/etc/resolv.conf` 重新生成。`/etc/resolv.conf` 是符号链接时不直接改写，交由生成它的服务处理。
-- 移除后如果一条 IPv4 DNS 都不剩，脚本仍然执行移除，并在输出和结果报告中告警。此时该机器无法解析域名，需要手工写入一条 IPv4 nameserver，或执行 `--restore-ipv6` 还原。
-- 不覆盖 NetworkManager 连接配置和 DHCP 客户端的 `supersede` 设置。这些来源下发的 IPv6 DNS 在 IPv6 关闭后一般不再生效；如仍出现 IPv6 nameserver，脚本会在 DNS 校验中告警。
+- 修改前检查 `/etc/resolv.conf` 是否配置了 IPv4 DNS；使用 systemd-resolved 的本地解析地址时，通过 `resolvectl dns` 检查上游。没有 IPv4 DNS 或无法读取上游时停止，保留原配置，不自动添加公共 DNS。此检查不验证 DNS 服务器的外网连通性。
+- 不覆盖 NetworkManager 连接配置和 DHCP 客户端的 `supersede` 设置。这些来源可能重新下发 IPv6 DNS；检查发现 `/etc/resolv.conf` 仍有 IPv6 nameserver 时会告警，需要在对应网络服务中处理。
+- 执行 `--restore-ipv6-dns` 可单独恢复原 DNS 配置，无需重启服务器。
 
 ## 运行前提
 
@@ -86,7 +95,7 @@ update, tools, nexttrace-mtr, bbr, ssh, ufw,
 fail2ban, journald, timezone
 ```
 
-默认跳过：关闭 IPv6、安装 Docker。
+默认跳过：移除 IPv6 DNS、安装 Docker。
 
 ```bash
 bash init_setup.sh --yes --mode recommended
@@ -100,7 +109,7 @@ bash init_setup.sh --yes --mode recommended
 update, bbr, ssh, ufw, journald, timezone
 ```
 
-默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、关闭 IPv6、安装 Docker。
+默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker。
 
 ```bash
 bash init_setup.sh --yes --mode minimal
@@ -139,8 +148,10 @@ bash init_setup.sh --yes --mode custom --enable update,bbr,ssh,ufw,journald,time
 可用模块名：
 
 ```text
-update tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone ipv6 docker all
+update tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone ipv6-dns docker all
 ```
+
+旧模块名 `ipv6`、`disable-ipv6` 现在也只执行 DNS 修改。新环境变量为 `ENABLE_IPV6_DNS`，兼容旧变量 `ENABLE_DISABLE_IPV6`；两者同时设置时使用新变量。`--no-ipv6-dns` 和旧参数 `--no-ipv6`、`--no-disable-ipv6` 均跳过 DNS 修改。
 
 模块配置依次应用模式默认值、环境变量和命令行开关，后者覆盖前者。多个 `--enable`、`--disable` 按出现顺序处理；命令行开关也会覆盖自定义菜单的选择。例如：
 
@@ -173,6 +184,7 @@ bash init_setup.sh --check
 bash init_setup.sh --dry-run --mode recommended
 bash init_setup.sh --status
 bash init_setup.sh --restore
+bash init_setup.sh --yes --restore-ipv6-dns
 bash init_setup.sh --yes --restore-ipv6
 ```
 
@@ -180,17 +192,36 @@ bash init_setup.sh --yes --restore-ipv6
 - `--dry-run` 只显示将启用的模块；
 - `--status` 输出当前服务和配置状态；
 - `--restore` 恢复最近一次由脚本创建的配置备份。
-- `--restore-ipv6` 只恢复 IPv6，不执行初始化模块。
+- `--restore-ipv6-dns` 只恢复被移除的 IPv6 DNS，不执行初始化模块。
+- `--restore-ipv6` 用于恢复旧版脚本彻底关闭的 IPv6。
 
-## 独立恢复 IPv6
+## 独立恢复 DNS
 
-恢复被脚本关闭的 IPv6，以 root 身份执行：
+以 root 身份执行：
+
+```bash
+bash init_setup.sh --yes --restore-ipv6-dns
+```
+
+此参数直接恢复 DNS，不显示初始化菜单；即使同时指定模式或模块开关，也只执行 DNS 恢复。不能与 `--restore`、`--restore-ipv6`、`--check`、`--status` 同时使用。可以先预览：
+
+```bash
+bash init_setup.sh --restore-ipv6-dns --dry-run
+```
+
+恢复会按修改前的原始内容写回 DNS 配置，再刷新解析服务，不操作 IPv6 系统开关、地址、路由或防火墙。DNS 原始配置保存在 `/var/backups/debian-init-setup/ipv6-dns/`，全部恢复并刷新成功后清理；重复修改保留第一次的原始内容，重复恢复不会覆盖后续改动。
+
+如果文件在 DNS 修改后被用户或网络服务改动，脚本保留现状并提示原始内容位置，返回非零退出码。刷新失败时也保留恢复记录。按提示处理后，可以重复执行同一命令。
+
+## 恢复旧版脚本关闭的 IPv6
+
+本版本不再关闭 IPv6。此前使用旧版关闭过 IPv6 的机器，仍可用原命令恢复：
 
 ```bash
 bash init_setup.sh --yes --restore-ipv6
 ```
 
-此参数直接进入 IPv6 恢复流程，不显示初始化菜单；即使同时指定模式或模块开关，也只执行 IPv6 恢复。不能与 `--restore`、`--check`、`--status` 同时使用。可以先预览：
+此参数直接进入 IPv6 恢复流程，不显示初始化菜单；即使同时指定模式或模块开关，也只执行 IPv6 恢复。不能与 `--restore`、`--restore-ipv6-dns`、`--check`、`--status` 同时使用。可以先预览：
 
 ```bash
 bash init_setup.sh --restore-ipv6 --dry-run
@@ -198,7 +229,7 @@ bash init_setup.sh --restore-ipv6 --dry-run
 
 恢复流程会备份并清理脚本写入的 IPv6 禁用系统参数和 GRUB 启动参数，恢复 UFW 的 IPv6 支持，并在 UFW 已启用时重载现有规则。随后写回被移除的 IPv6 DNS，开启各接口的 IPv6，并恢复地址和路由。本版本的 UFW 配置流程会保留已有 IPv6 规则，避免它们在禁用 IPv6 支持时被 UFW 清空；旧版运行时已经丢失的自定义规则仍需从原备份恢复。
 
-- 使用本版本关闭 IPv6 时，会先保存地址、路由和网卡编号。同一次系统启动内、网卡编号未变化时，恢复会使用这份快照；重复关闭不会覆盖第一次保存的数据。
+- `3.1.0` 至 `3.2.1` 关闭 IPv6 时会保存地址、路由和网卡编号。同一次系统启动内、网卡编号未变化时，恢复会使用这份快照。
 - 旧版关闭时没有快照，或快照因重启、网卡变化而不再适用时，会尝试从 Debian 的 ifupdown 静态网络配置恢复 IPv6 地址和网关。其他网络管理服务需要按自身配置重新分配地址。
 - DNS 配置按关闭前的原始内容整文件写回。如果某个文件在关闭之后被改动过，脚本不覆盖它，只提示原始内容的保存位置，需要手工处理。
 - 如果当前内核已经通过 `ipv6.disable=1` 启动，脚本会撤销禁用配置并提示重启，不会自动重启服务器。重启后可再次执行恢复命令检查结果。
@@ -240,7 +271,17 @@ python -m unittest discover -s tests -v
 
 `3.2.0` 的 DNS 处理目前只通过上述回归测试验证，未在实机上验证 `resolvconf -u`、`networkctl reload` 和 `systemd-resolved` 重启后的重新生成结果。
 
+`4.0.0` 补充 DNS 单独执行和恢复、IPv6 网络配置保持原样、IPv4 DNS 检查、恢复冲突和刷新失败重试等隔离测试。此版本尚未在 Debian 实机上验证。
+
 ## 版本记录
+
+### 4.0.0
+
+- IPv6 模块行为变更：只移除 IPv6 DNS，不再禁用 IPv6 接口、写入禁用系统参数或 GRUB 启动参数，也不再关闭 UFW 的 IPv6 支持。
+- 模块名改为 `ipv6-dns`，环境变量改为 `ENABLE_IPV6_DNS`；旧名称保留为 DNS 修改的兼容入口。
+- 增加 `--restore-ipv6-dns` 单独恢复 DNS；保留 `--restore-ipv6`，用于恢复旧版彻底关闭的 IPv6。
+- 没有 IPv4 DNS 时在修改前停止；systemd-resolved 的本地解析地址会进一步检查其上游。
+- DNS 恢复冲突和解析服务刷新失败会返回非零退出码并保留记录，支持再次恢复。
 
 ### 3.2.1
 
