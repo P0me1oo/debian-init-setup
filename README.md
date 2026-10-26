@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`4.0.0`
+- 当前版本：`4.0.1`
 - 主脚本：`init_setup.sh`
 
 ## 支持的模块
@@ -177,6 +177,8 @@ bash init_setup.sh --help
 --logfile PATH
 ```
 
+默认时区为新加坡（`Asia/Singapore`，UTC+8），可通过 `--timezone` 参数或 `TARGET_TIMEZONE` 环境变量覆盖。
+
 检查和维护：
 
 ```bash
@@ -274,6 +276,10 @@ python -m unittest discover -s tests -v
 `4.0.0` 补充 DNS 单独执行和恢复、IPv6 网络配置保持原样、IPv4 DNS 检查、恢复冲突和刷新失败重试等隔离测试。此版本尚未在 Debian 实机上验证。
 
 ## 版本记录
+
+### 4.0.1
+
+- 默认时区调整为新加坡（`Asia/Singapore`），同步帮助说明。
 
 ### 4.0.0
 

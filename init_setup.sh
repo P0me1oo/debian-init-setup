@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="4.0.1"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -18,7 +18,7 @@ SSH_HARDENING_FILE="${SSH_DROPIN_DIR}/000-init-setup-hardening.conf"
 JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_LIMIT_FILE="${JOURNALD_DROPIN_DIR}/99-init-setup-limits.conf"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAeb9XSLy+uB8WrKCBopAfKSuBejJnvMJv+lygUXKXLB mjj}"
-TARGET_TIMEZONE="${TARGET_TIMEZONE:-Asia/Shanghai}"
+TARGET_TIMEZONE="${TARGET_TIMEZONE:-Asia/Singapore}"
 SCRIPT_START_TS="$(date +%s)"
 LAST_ERR_LINE=""
 LAST_ERR_COMMAND=""
@@ -120,7 +120,7 @@ usage() {
       --enable a,b,c               开启模块
       --ssh-port PORT              SSH 端口，默认 10721
       --ssh-key "KEY"              root SSH 公钥
-      --timezone TZ                时区，默认 Asia/Shanghai
+      --timezone TZ                时区，默认 Asia/Singapore
       --journal-max-use SIZE        systemd journal 最大占用，默认 50M；支持 100M、1G 等格式
       --logfile PATH               日志路径，默认 /var/log/debian_init_setup.log
       --check                      只检查运行环境，不修改系统
