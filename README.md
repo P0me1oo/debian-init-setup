@@ -2,14 +2,16 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`4.0.1`
+- 当前版本：`4.1.0`
 - 主脚本：`init_setup.sh`
+- 版本记录：[CHANGELOG.md](CHANGELOG.md)
 
 ## 支持的模块
 
 | 模块 | 作用 |
 | --- | --- |
 | `update` | 更新系统软件包并执行升级 |
+| `kernel` | 升级到当前软件源提供的最新 Linux 内核，不自动重启 |
 | `tools` | 安装 curl、wget、git、openssh-server、iproute2、sudo 和 iperf3 |
 | `nexttrace-mtr` | 安装 NextTrace 和 mtr |
 | `bbr` | 配置 BBR + fq |
@@ -22,6 +24,28 @@
 | `docker` | 安装 Docker Engine、Buildx 和 Compose 插件 |
 
 脚本不负责配置 ZRAM、swapfile 或 htop。
+
+## Linux 内核升级
+
+推荐、精简和完整模式默认启用内核升级；交互式自定义模式也默认开启。每次运行都会获取当前 Debian 发行版软件源提供的最新内核，不固定到某个漏洞的修复版本。普通软件包升级可能跳过需要新增依赖的内核更新，因此此模块会单独安装或更新内核跟踪包及其依赖。
+
+保留云内核、实时内核等现有类型，使用不限定内核系列的跟踪包；例如已安装的 `linux-image-6.1-amd64` 会改用 `linux-image-amd64` 跟踪当前软件源的最新系列。没有跟踪包时，按当前运行的 Debian 内核类型补装，例如 AMD64 的 `linux-image-amd64`、云内核的 `linux-image-cloud-amd64` 和 ARM64 的 `linux-image-arm64`。遵循现有软件源和版本锁定设置，保留已有内核；依赖冲突需要移除软件包时停止。
+
+这里的“最新”以当前发行版已配置软件源的候选版本为准，不额外引入第三方内核源或切换到 kernel.org 主线。若自行设置了版本锁定或软件源优先级，仍需先解除相应限制才能获取更新。
+
+脚本不会自动重启服务器。执行结束时会提示自行安排重启；即使后续模块失败，已完成内核安装时仍会显示提示。重启后用 `uname -r` 确认实际运行的内核。
+
+CVE-2026-98432 的修复需要软件源提供包含补丁的内核，并在重启后运行该内核。安装步骤完成不代表漏洞已修复；应同时对照 [Debian 漏洞跟踪记录](https://security-tracker.debian.org/tracker/CVE-2026-98432) 核对内核软件包版本。请确保当前 Debian 版本对应的安全更新源已启用。
+
+单独升级内核：
+
+```bash
+bash init_setup.sh --yes --mode custom --enable kernel
+```
+
+跳过内核升级可使用 `--disable kernel`、`--no-kernel-upgrade` 或环境变量 `ENABLE_KERNEL_UPGRADE=no`。此开关只控制独立内核模块，常规系统更新仍可能更新已安装的内核软件包。
+
+共用宿主机内核的容器会停止此模块，需在宿主机上升级；无法识别且未安装 Debian 内核跟踪包的第三方内核也会报错，避免切换内核类型。
 
 ## 只移除 IPv6 DNS
 
@@ -91,7 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init
 默认启用：
 
 ```text
-update, tools, nexttrace-mtr, bbr, ssh, ufw,
+update, kernel, tools, nexttrace-mtr, bbr, ssh, ufw,
 fail2ban, journald, timezone
 ```
 
@@ -106,7 +130,7 @@ bash init_setup.sh --yes --mode recommended
 默认启用：
 
 ```text
-update, bbr, ssh, ufw, journald, timezone
+update, kernel, bbr, ssh, ufw, journald, timezone
 ```
 
 默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker。
@@ -142,13 +166,13 @@ bash init_setup.sh --interactive --mode custom
 ```bash
 bash init_setup.sh --yes --mode recommended --disable fail2ban,nexttrace-mtr
 bash init_setup.sh --yes --mode minimal --enable tools
-bash init_setup.sh --yes --mode custom --enable update,bbr,ssh,ufw,journald,timezone
+bash init_setup.sh --yes --mode custom --enable update,kernel,bbr,ssh,ufw,journald,timezone
 ```
 
 可用模块名：
 
 ```text
-update tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone ipv6-dns docker all
+update kernel tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone ipv6-dns docker all
 ```
 
 旧模块名 `ipv6`、`disable-ipv6` 现在也只执行 DNS 修改。新环境变量为 `ENABLE_IPV6_DNS`，兼容旧变量 `ENABLE_DISABLE_IPV6`；两者同时设置时使用新变量。`--no-ipv6-dns` 和旧参数 `--no-ipv6`、`--no-disable-ipv6` 均跳过 DNS 修改。
@@ -269,95 +293,10 @@ python -m unittest discover -s tests -v
 
 测试使用临时目录和模拟命令，不会修改当前机器的 SSH、防火墙或 Docker。真实服务、内核参数、软件源和重启后的状态仍需在 Debian 测试机上验证。
 
+内核升级测试覆盖默认选项、独立执行、最新系列跟踪、内核类型保留、缺少跟踪包、容器和未知内核、安装失败及手动重启提示；未在 Debian 实机安装内核或执行重启。
+
 `3.1.0` 已在 Debian 12、静态 IPv6、已启用 UFW 的服务器上验证新版关闭后恢复、重复关闭与恢复，以及 `3.0.5` 关闭后由新版恢复。各次恢复后的 IPv6 HTTPS 访问均成功，IPv4 地址和路由、SSH 配置、已有 IPv4/IPv6 防火墙规则通过一致性检查。测试结束后已恢复原始配置。需要重启才能生效的分支通过隔离测试验证，未执行实机重启。
 
 `3.2.0` 的 DNS 处理目前只通过上述回归测试验证，未在实机上验证 `resolvconf -u`、`networkctl reload` 和 `systemd-resolved` 重启后的重新生成结果。
 
 `4.0.0` 补充 DNS 单独执行和恢复、IPv6 网络配置保持原样、IPv4 DNS 检查、恢复冲突和刷新失败重试等隔离测试。此版本尚未在 Debian 实机上验证。
-
-## 版本记录
-
-### 4.0.1
-
-- 默认时区调整为新加坡（`Asia/Singapore`），同步帮助说明。
-
-### 4.0.0
-
-- IPv6 模块行为变更：只移除 IPv6 DNS，不再禁用 IPv6 接口、写入禁用系统参数或 GRUB 启动参数，也不再关闭 UFW 的 IPv6 支持。
-- 模块名改为 `ipv6-dns`，环境变量改为 `ENABLE_IPV6_DNS`；旧名称保留为 DNS 修改的兼容入口。
-- 增加 `--restore-ipv6-dns` 单独恢复 DNS；保留 `--restore-ipv6`，用于恢复旧版彻底关闭的 IPv6。
-- 没有 IPv4 DNS 时在修改前停止；systemd-resolved 的本地解析地址会进一步检查其上游。
-- DNS 恢复冲突和解析服务刷新失败会返回非零退出码并保留记录，支持再次恢复。
-
-### 3.2.1
-
-- 结束报告分别列出已选择和已跳过的模块。
-
-### 3.2.0
-
-- 关闭 IPv6 时同步清理 DNS 配置中的 IPv6 nameserver，覆盖 `systemd-resolved`、`systemd-networkd`、`resolvconf`、ifupdown 和 `/etc/resolv.conf`，只保留 IPv4 DNS。
-- 改完上游配置后按需执行 `resolvconf -u`、`networkctl reload` 和重启 `systemd-resolved`，再校验生效的 `/etc/resolv.conf`；没有 IPv4 DNS 时告警并记入结果报告。
-- `--restore-ipv6` 写回被移除的 IPv6 nameserver；关闭之后被改动过的文件不覆盖，只提示原始内容位置。
-- 状态报告增加生效的 DNS nameserver 列表。
-- 补充 DNS 过滤、带端口和 DoT 写法、重复关闭、恢复与不覆盖改动文件的回归测试。
-
-### 3.1.1
-
-- 推荐和精简模式列出默认启用及默认跳过的模块，完整模式显示“默认启用：全部模块”。
-- 推荐模式介绍补全系统更新、NextTrace 和 mtr、BBR + fq，并同步更新三种预设模式的文档。
-
-### 3.1.0
-
-- 增加 `--restore-ipv6` 独立恢复入口，支持预览、配置备份、UFW IPv6 恢复和地址、路由校验。
-- 关闭 IPv6 前保存网络状态，支持同次启动内恢复快照，并兼容旧版关闭后的 ifupdown 静态配置恢复。
-- UFW 禁用 IPv6 支持时保留已有 IPv6 用户规则，失败时也尝试恢复规则文件。
-- 区分即时恢复成功与需要重启才能生效，检查失败时保留恢复快照。
-- 常用工具增加 sudo 和 iperf3，执行报告同时显示其版本。
-- 补充独立入口、重复执行、备份失败、静态网络恢复和启动参数等回归测试。
-
-### 3.0.5
-
-- 自定义交互菜单默认开启全部模块，回车确认开启，输入 `n` 关闭；显式设置的环境变量和命令行开关仍按原有优先级生效。
-- 区分回车和输入中断，读取不到回答时停止执行。
-- 保留无人值守自定义模式从全部关闭开始的行为。
-- 增加回车默认值、单项关闭、显式覆盖和输入中断的回归测试。
-
-### 3.0.4
-
-- 在线入口统一使用 `--interactive` 显示模式菜单，移除并列的无人值守在线命令。
-
-### 3.0.3
-
-- 精简 README 和命令文件中的在线启动命令，保留交互菜单和非交互执行所需的 `--yes` 参数。
-
-### 3.0.2
-
-- 将日志路径检查和恢复后的命令判断改为明确的条件分支，修复 GitHub ShellCheck 检查失败。
-- 在线运行示例已使用实际仓库地址，可直接复制执行。
-
-### 3.0.1
-
-- 修复模块环境变量被模式默认值覆盖的问题，保持命令行开关优先。
-- 修复 SSH 备份失败后仍写入登录配置、自动恢复失败未报告的问题。
-- Docker 已有运行时检查覆盖官方软件包和未通过软件包安装的命令。
-- 日志、运行锁和配置恢复不再更改已有父目录权限。
-- 补充上述分支及备份文件缺失的回归测试，隔离测试中的系统参数和 GRUB 命令。
-- 在线运行示例使用 `main` 分支，上传文件后无需先创建版本标签。
-
-### 3.0.0
-
-- 增加推荐、精简、完整和自定义模式。
-- 非交互执行必须显式传入 `--yes`。
-- 在线下载到文件后执行时保留交互菜单。
-- 移除 htop、ZRAM 和 swapfile 功能。
-- 推荐模式不启用 IPv6 和 Docker。
-- 精简模式只启用系统更新、BBR + fq、SSH、UFW、journald 限制、时区和 chrony。
-- 增加运行环境检查、模拟执行、状态查看和最近备份恢复。
-- 增加 SSH 配置失败回滚、运行锁和独立备份目录。
-- Docker 检测到已有容器运行时后默认停止，替换需要显式参数。
-
-### 2.0.0
-
-- UFW 只添加 SSH 端口放行，保留已有规则。
-- 移除额外端口自动放行配置。
-- BBR 只加载自身的系统参数。

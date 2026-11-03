@@ -90,6 +90,9 @@ apt_install() {{ record_call apt_install "$@"; }}
 systemctl() {{ record_call systemctl "$@"; return 1; }}
 sysctl() {{ record_call sysctl "$@"; }}
 update-grub() {{ record_call update-grub "$@"; }}
+reboot() {{ record_call reboot "$@"; return 99; }}
+shutdown() {{ record_call shutdown "$@"; return 99; }}
+kexec() {{ record_call kexec "$@"; return 99; }}
 ss() {{ return 1; }}
 sshd() {{ return 1; }}
 ufw() {{ record_call ufw "$@"; }}
@@ -190,7 +193,8 @@ ip() {
             ("full", {"ENABLE_SYSTEM_UPDATE": "yes", "ENABLE_COMMON_TOOLS": "yes", "ENABLE_NEXTTRACE_MTR": "yes", "ENABLE_BBR": "yes", "ENABLE_SSH_BASELINE": "yes", "ENABLE_UFW": "yes", "ENABLE_FAIL2BAN": "yes", "ENABLE_JOURNAL_LIMIT": "yes", "ENABLE_TIMEZONE": "yes", "ENABLE_IPV6_DNS": "yes", "ENABLE_DOCKER": "yes"}),
             ("custom", {"ENABLE_SYSTEM_UPDATE": "no", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "no", "ENABLE_SSH_BASELINE": "no", "ENABLE_UFW": "no", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "no", "ENABLE_TIMEZONE": "no", "ENABLE_IPV6_DNS": "no", "ENABLE_DOCKER": "no"}),
         ):
-            result = self.run_script(f"MODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_IPV6_DNS $ENABLE_DOCKER\"\n")
+            expected["ENABLE_KERNEL_UPGRADE"] = "no" if mode == "custom" else "yes"
+            result = self.run_script(f"INTERACTIVE_MODE=no\nMODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_IPV6_DNS $ENABLE_DOCKER $ENABLE_KERNEL_UPGRADE\"\n")
             self.assertIn(" ".join(expected.values()), result.stdout.splitlines())
 
     def test_removed_swap_and_htop_are_not_referenced(self):
@@ -212,19 +216,19 @@ ip() {
         return self.run_script(body, expected=expected)
 
     def test_interactive_custom_enter_keeps_all_modules_enabled(self):
-        result = self.run_custom_menu([""] * 11)
-        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
+        result = self.run_custom_menu([""] * 12)
+        self.assertEqual(result.stdout.count(": 开启\n"), 12, result.stdout)
         self.assertNotIn(": 关闭/跳过", result.stdout)
 
     def test_interactive_custom_no_disables_only_selected_module(self):
-        result = self.run_custom_menu([""] * 9 + ["n", ""])
-        self.assertEqual(result.stdout.count(": 开启\n"), 10, result.stdout)
+        result = self.run_custom_menu([""] * 10 + ["n", ""])
+        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
         self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 开启", result.stdout)
 
     def test_interactive_custom_enter_respects_explicit_disabled_modules(self):
-        result = self.run_custom_menu([""] * 11, "--disable", "ipv6,docker")
-        self.assertEqual(result.stdout.count(": 开启\n"), 9, result.stdout)
+        result = self.run_custom_menu([""] * 12, "--disable", "ipv6,docker")
+        self.assertEqual(result.stdout.count(": 开启\n"), 10, result.stdout)
         self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 关闭/跳过", result.stdout)
 
@@ -313,6 +317,138 @@ done
         )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("--yes", result.stdout + result.stderr)
+
+    KERNEL_MOCK = r'''
+systemd-detect-virt() { return 1; }
+uname() { printf '%s\n' "${TEST_KERNEL_RELEASE:-6.1.0-42-amd64}"; }
+dpkg-query() { printf '%s' "${TEST_KERNEL_PACKAGES:-}"; }
+apt-get() { record_call apt-get "$@"; }
+'''
+
+    def test_kernel_module_controls_and_dry_run(self):
+        for arguments, enabled in (
+            ([], True),
+            (["--disable", "kernel"], False),
+            (["--no-kernel-upgrade"], False),
+            (["--no-kernel"], False),
+            (["--disable", "all", "--enable", "kernel-upgrade"], True),
+            (["--enable", "all", "--disable", "linux-kernel"], False),
+            (["--no-kernel-upgrade", "--enable", "kernel"], True),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_script("", main_arguments=["--dry-run", *arguments])
+                line = next(line for line in result.stdout.splitlines() if "升级 Linux 内核" in line)
+                self.assertTrue(line.endswith("开启" if enabled else "关闭/跳过"), result.stdout)
+                self.assertEqual(self.calls(), "")
+
+    def test_kernel_environment_override_and_cli_precedence(self):
+        for arguments, enabled in (([], False), (["--enable", "kernel"], True)):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(
+                    'ENV_MODULE_OVERRIDES[ENABLE_KERNEL_UPGRADE]=no\n',
+                    main_arguments=["--dry-run", "--mode", "full", *arguments],
+                )
+                line = next(line for line in result.stdout.splitlines() if "升级 Linux 内核" in line)
+                self.assertTrue(line.endswith("开启" if enabled else "关闭/跳过"), result.stdout)
+
+    def test_custom_menu_can_disable_only_kernel_upgrade(self):
+        result = self.run_custom_menu(["", "n"] + [""] * 10)
+        self.assertIn("Linux 内核升级（不自动重启）: 关闭/跳过", result.stdout)
+        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
+
+    def test_kernel_upgrade_tracks_latest_series_and_preserves_flavors(self):
+        packages = (
+            "installed\tlinux-image-cloud-amd64\tlinux-image-6.12.115+deb13.1-cloud-amd64 (= 6.12.115-2)\n"
+            "installed\tlinux-image-6.1-cloud-amd64\tlinux-image-6.1.0-42-cloud-amd64 (= 6.1.190-1)\n"
+            "installed\tlinux-image-6.1-rt-amd64\tlinux-image-6.1.0-42-rt-amd64 (= 6.1.190-1)\n"
+            "installed\tlinux-image-6.1.0-42-amd64\tkmod, linux-base, initramfs-tools\n"
+            "config-files\tlinux-image-amd64\tlinux-image-6.1.0-41-amd64\n"
+        )
+        result = self.run_script(
+            self.KERNEL_MOCK + "\nTEST_KERNEL_PACKAGES=" + shlex.quote(packages) + "\nupgrade_linux_kernel\n"
+        )
+        self.assertEqual(self.calls().splitlines(), [
+            "apt-get update", "apt_install --no-remove linux-image-cloud-amd64 linux-image-rt-amd64",
+        ])
+        self.assertIn("新内核需手动重启后生效", result.stdout)
+        self.assertIn("本脚本不会自动重启", result.stdout)
+        self.assertIn("uname -r", result.stdout)
+        self.assertIn("安装完成不代表正在运行的内核已更新", result.stdout)
+        self.assertNotIn("执行结果: 全部成功", result.stdout)
+
+    def test_kernel_upgrade_adds_missing_tracking_package_for_running_flavor(self):
+        for release, package in (
+            ("6.1.0-42-amd64", "linux-image-amd64"),
+            ("6.12.115+deb13.1-cloud-amd64", "linux-image-cloud-amd64"),
+            ("6.1.0-42-rt-amd64", "linux-image-rt-amd64"),
+            ("6.1.0-42-arm64", "linux-image-arm64"),
+            ("6.12.115+deb13.1-cloud-arm64", "linux-image-cloud-arm64"),
+            ("6.1.0-42-rt-arm64", "linux-image-rt-arm64"),
+            ("6.1.0-42-686-pae", "linux-image-686-pae"),
+            ("6.1.0-42-armmp-lpae", "linux-image-armmp-lpae"),
+        ):
+            with self.subTest(release=release):
+                self.trace_file.unlink(missing_ok=True)
+                self.run_script(
+                    self.KERNEL_MOCK + "\nTEST_KERNEL_RELEASE=" + shlex.quote(release) + "\n"
+                    "TEST_KERNEL_PACKAGES=$'installed\\tlinux-image-6.1.0-42-amd64\\tkmod, linux-base\\n'\n"
+                    "upgrade_linux_kernel\n"
+                )
+                self.assertEqual(self.calls().splitlines(), [
+                    "apt-get update", "apt_install --no-remove " + package,
+                ])
+
+    def test_kernel_upgrade_rejects_containers_before_package_changes(self):
+        result = self.run_script(self.KERNEL_MOCK + r'''
+systemd-detect-virt() { return 0; }
+upgrade_linux_kernel
+''', expected=1)
+        self.assertIn("请在宿主机上更新内核", result.stdout)
+        self.assertEqual(self.calls(), "")
+
+    def test_unknown_kernel_flavor_stops_before_package_changes(self):
+        result = self.run_script(
+            self.KERNEL_MOCK + "\nTEST_KERNEL_RELEASE=6.8.12-1-pve\nupgrade_linux_kernel\n", expected=1,
+        )
+        self.assertIn("无法确定当前内核", result.stdout)
+        self.assertEqual(self.calls(), "")
+
+    def test_kernel_upgrade_failures_do_not_report_completion_or_restart(self):
+        for failure in ("index", "install"):
+            with self.subTest(failure=failure):
+                self.trace_file.unlink(missing_ok=True)
+                override = (
+                    'apt-get() { record_call apt-get "$@"; return 1; }\n' if failure == "index" else
+                    'apt_install() { record_call apt_install "$@"; return 1; }\n'
+                )
+                result = self.run_script(self.KERNEL_MOCK + "\n" + override + "upgrade_linux_kernel\n", expected=1)
+                self.assertNotIn("内核安装/更新步骤完成", result.stdout)
+                self.assertNotIn("初始化步骤已完成", result.stdout)
+                self.assertNotIn("reboot", self.calls())
+                self.assertNotIn("shutdown", self.calls())
+                if failure == "index":
+                    self.assertNotIn("apt_install", self.calls())
+
+    def test_kernel_reboot_reminder_survives_a_later_module_failure(self):
+        result = self.run_script(
+            self.KERNEL_MOCK + "\nupgrade_linux_kernel\nfalse\n", expected=1,
+        )
+        self.assertIn("执行结果: 部分错误", result.stdout)
+        self.assertIn("请自行安排执行 reboot", result.stdout)
+        self.assertNotIn("reboot", self.calls())
+
+    def test_kernel_only_entry_upgrades_without_system_upgrade_or_reboot(self):
+        result = self.run_script(self.KERNEL_MOCK + r'''
+require_root() { :; }
+prepare_logfile() { :; }
+acquire_run_lock() { :; }
+check_runtime_environment() { :; }
+print_execution_report() { :; }
+''', main_arguments=["--yes", "--mode", "custom", "--enable", "kernel"])
+        self.assertEqual(self.calls().splitlines(), [
+            "apt-get update", "apt_install --no-remove linux-image-amd64",
+        ])
+        self.assertIn("已选择模块:\n- 1.5) 升级 Linux 内核（不自动重启）", result.stdout)
 
     def test_restore_ipv6_entry_does_not_run_initialization_modules(self):
         self.prepare_ipv6_fixture()

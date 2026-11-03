@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="4.0.1"
+SCRIPT_VERSION="4.1.0"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -25,6 +25,7 @@ LAST_ERR_COMMAND=""
 SSH_READY=0
 SSH_SERVICE_RELOADED=0
 IPV6_REBOOT_REQUIRED=0
+KERNEL_UPDATE_COMPLETED=0
 IPV6_DNS_CHANGED_FILES=0
 INTERACTIVE_MODE="${INTERACTIVE_MODE:-auto}"
 ORIGINAL_STDIN_IS_TTY=0
@@ -36,7 +37,7 @@ ORIGINAL_STDOUT_IS_TTY=0
 # 兼容旧开关；旧名称现在也只控制 DNS 清理。
 ENABLE_IPV6_DNS="${ENABLE_IPV6_DNS:-${ENABLE_DISABLE_IPV6:-}}"
 declare -a MODULE_TOGGLE_NAMES=(
-  ENABLE_SYSTEM_UPDATE ENABLE_COMMON_TOOLS ENABLE_NEXTTRACE_MTR ENABLE_IPV6_DNS
+  ENABLE_SYSTEM_UPDATE ENABLE_KERNEL_UPGRADE ENABLE_COMMON_TOOLS ENABLE_NEXTTRACE_MTR ENABLE_IPV6_DNS
   ENABLE_BBR ENABLE_SSH_BASELINE ENABLE_UFW ENABLE_FAIL2BAN ENABLE_JOURNAL_LIMIT
   ENABLE_TIMEZONE ENABLE_DOCKER
 )
@@ -49,6 +50,7 @@ done
 unset module_var
 
 ENABLE_SYSTEM_UPDATE="${ENABLE_SYSTEM_UPDATE:-yes}"
+ENABLE_KERNEL_UPGRADE="${ENABLE_KERNEL_UPGRADE:-yes}"
 ENABLE_COMMON_TOOLS="${ENABLE_COMMON_TOOLS:-yes}"
 ENABLE_IPV6_DNS="${ENABLE_IPV6_DNS:-yes}"
 ENABLE_BBR="${ENABLE_BBR:-yes}"
@@ -109,7 +111,8 @@ usage() {
 自定义交互默认开启各模块：[Y/n] 回车开启，输入 n 关闭。
 
 模块名:
-  update, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6-dns, docker, all
+  update, kernel, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6-dns, docker, all
+  kernel 升级到当前软件源提供的最新 Linux 内核，不自动重启；新内核需用户手动重启后生效。
   ipv6-dns 只移除 IPv6 DNS，保留 IPv6 联网能力；兼容旧模块名 ipv6。
 
 选项:
@@ -118,6 +121,7 @@ usage() {
       --mode MODE                  模式：recommended、minimal、full、custom
       --disable a,b,c              关闭模块，例如 --disable docker,ipv6-dns
       --enable a,b,c               开启模块
+      --no-kernel-upgrade           跳过 Linux 内核升级
       --ssh-port PORT              SSH 端口，默认 10721
       --ssh-key "KEY"              root SSH 公钥
       --timezone TZ                时区，默认 Asia/Singapore
@@ -205,6 +209,7 @@ apply_mode_defaults() {
   case "$MODE" in
     recommended)
       ENABLE_SYSTEM_UPDATE=yes
+      ENABLE_KERNEL_UPGRADE=yes
       ENABLE_COMMON_TOOLS=yes
       ENABLE_NEXTTRACE_MTR=yes
       ENABLE_BBR=yes
@@ -218,6 +223,7 @@ apply_mode_defaults() {
       ;;
     minimal)
       ENABLE_SYSTEM_UPDATE=yes
+      ENABLE_KERNEL_UPGRADE=yes
       ENABLE_COMMON_TOOLS=no
       ENABLE_NEXTTRACE_MTR=no
       ENABLE_BBR=yes
@@ -231,6 +237,7 @@ apply_mode_defaults() {
       ;;
     full)
       ENABLE_SYSTEM_UPDATE=yes
+      ENABLE_KERNEL_UPGRADE=yes
       ENABLE_COMMON_TOOLS=yes
       ENABLE_NEXTTRACE_MTR=yes
       ENABLE_BBR=yes
@@ -244,6 +251,7 @@ apply_mode_defaults() {
       ;;
     custom)
       ENABLE_SYSTEM_UPDATE=no
+      ENABLE_KERNEL_UPGRADE=no
       ENABLE_COMMON_TOOLS=no
       ENABLE_NEXTTRACE_MTR=no
       ENABLE_BBR=no
@@ -267,8 +275,9 @@ set_toggle_by_name() {
   name="${name//_/-}"
   case "$name" in
     all)
-      ENABLE_SYSTEM_UPDATE="$value"; ENABLE_COMMON_TOOLS="$value"; ENABLE_NEXTTRACE_MTR="$value"; ENABLE_IPV6_DNS="$value"; ENABLE_BBR="$value"; ENABLE_SSH_BASELINE="$value"; ENABLE_UFW="$value"; ENABLE_FAIL2BAN="$value"; ENABLE_JOURNAL_LIMIT="$value"; ENABLE_TIMEZONE="$value"; ENABLE_DOCKER="$value" ;;
+      ENABLE_SYSTEM_UPDATE="$value"; ENABLE_KERNEL_UPGRADE="$value"; ENABLE_COMMON_TOOLS="$value"; ENABLE_NEXTTRACE_MTR="$value"; ENABLE_IPV6_DNS="$value"; ENABLE_BBR="$value"; ENABLE_SSH_BASELINE="$value"; ENABLE_UFW="$value"; ENABLE_FAIL2BAN="$value"; ENABLE_JOURNAL_LIMIT="$value"; ENABLE_TIMEZONE="$value"; ENABLE_DOCKER="$value" ;;
     update|upgrade|system-update) ENABLE_SYSTEM_UPDATE="$value" ;;
+    kernel|kernel-upgrade|linux-kernel) ENABLE_KERNEL_UPGRADE="$value" ;;
     tools|common-tools) ENABLE_COMMON_TOOLS="$value" ;;
     nexttrace-mtr|nexttrace|mtr|trace-tools|net-trace|network-trace) ENABLE_NEXTTRACE_MTR="$value" ;;
     ipv6-dns|ipv6|disable-ipv6) ENABLE_IPV6_DNS="$value" ;;
@@ -315,6 +324,7 @@ parse_args() {
       --restore-ipv6-dns) RESTORE_IPV6_DNS_ONLY=1; INTERACTIVE_MODE="no"; shift ;;
       --replace-existing-runtime) REPLACE_EXISTING_RUNTIME=1; shift ;;
       --no-update|--no-upgrade) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(update); shift ;;
+      --no-kernel|--no-kernel-upgrade) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(kernel); shift ;;
       --no-tools) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(tools); shift ;;
       --no-nexttrace-mtr|--no-trace-tools|--no-net-trace) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(nexttrace-mtr); shift ;;
       --no-ipv6-dns|--no-ipv6|--no-disable-ipv6) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ipv6-dns); shift ;;
@@ -481,6 +491,7 @@ prompt_configuration() {
   print_section "0) 运行配置"
   print_info "回车采用大写字母所示默认值：Y 开启，N 关闭；输入 n 可关闭该项。"
   prompt_yes_no ENABLE_SYSTEM_UPDATE "执行系统更新/升级" || return 1
+  prompt_yes_no ENABLE_KERNEL_UPGRADE "升级 Linux 内核（不自动重启）" || return 1
   prompt_yes_no ENABLE_COMMON_TOOLS "安装常用工具" || return 1
   prompt_yes_no ENABLE_NEXTTRACE_MTR "安装 NextTrace 和 mtr" || return 1
   prompt_yes_no ENABLE_BBR "开启 BBR + fq" || return 1
@@ -498,10 +509,10 @@ prompt_mode_selection() {
   [ "$MODE_EXPLICIT" -eq 1 ] && return 0
   print_section "0) 选择运行模式"
   echo "1) 推荐模式"
-  echo "   默认启用：系统更新、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制和时间同步"
+  echo "   默认启用：系统更新、内核升级、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制和时间同步"
   echo "   默认跳过：移除 IPv6 DNS、安装 Docker"
   echo "2) 精简模式"
-  echo "   默认启用：系统更新、BBR + fq、SSH、防火墙、日志限制和时间同步"
+  echo "   默认启用：系统更新、内核升级、BBR + fq、SSH、防火墙、日志限制和时间同步"
   echo "   默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker"
   echo "3) 完整模式"
   echo "   默认启用：全部模块"
@@ -529,6 +540,7 @@ print_config_summary() {
   print_section "0.5) 本次执行配置摘要"
   printf '脚本版本: %s（作者 %s）\n' "$SCRIPT_VERSION" "$SCRIPT_AUTHOR"
   printf '系统更新/升级: %s\n' "$(state_text "$ENABLE_SYSTEM_UPDATE")"
+  printf 'Linux 内核升级（不自动重启）: %s\n' "$(state_text "$ENABLE_KERNEL_UPGRADE")"
   printf '常用工具: %s\n' "$(state_text "$ENABLE_COMMON_TOOLS")"
   printf 'NextTrace 和 mtr: %s\n' "$(state_text "$ENABLE_NEXTTRACE_MTR")"
   printf 'BBR + fq: %s\n' "$(state_text "$ENABLE_BBR")"
@@ -568,6 +580,8 @@ print_final_summary() {
   if [ "$exit_code" -eq 0 ] && [ "${#SOFT_ERRORS[@]}" -eq 0 ]; then
     if [ "$RESTORE_IPV6_ONLY" -eq 1 ] && [ "$IPV6_REBOOT_REQUIRED" -eq 1 ]; then
       echo "执行结果: 恢复配置已完成，重启后生效"
+    elif [ "$KERNEL_UPDATE_COMPLETED" -eq 1 ]; then
+      echo "执行结果: 初始化步骤已完成，新内核需手动重启后生效"
     else
       echo "执行结果: 全部成功"
     fi
@@ -601,6 +615,10 @@ print_final_summary() {
     else
       echo "- 无"
     fi
+  fi
+  if [ "$KERNEL_UPDATE_COMPLETED" -eq 1 ]; then
+    print_warn "内核安装/更新步骤已完成，本脚本不会自动重启。请自行安排执行 reboot，并在重启后用 uname -r 确认运行的是更新后的内核。"
+    print_warn "安装完成不代表正在运行的内核已更新；安全补丁需在启动更新后的内核后生效。"
   fi
   printf '总计耗时: %d分%02d秒\n' "$elapsed_min" "$elapsed_sec"
 }
@@ -745,6 +763,61 @@ update_system_packages() {
   apt-get update
   apt-get upgrade -y
   print_ok "系统更新完成"
+}
+
+upgrade_linux_kernel() {
+  local running_kernel installed status package dependencies
+  local -a kernel_packages=()
+  local -A kernel_package_seen=()
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet; then
+    print_err "当前环境共用宿主机内核，无法在容器内升级；请在宿主机上更新内核并安排重启。"
+    return 1
+  fi
+  running_kernel="$(uname -r)" || return 1
+  print_info "当前运行的内核：${running_kernel}"
+  # 保留云内核、实时内核等类型，使用不限定系列的跟踪包获取软件源最新内核。
+  # 跟踪包依赖具体的 linux-image 内核镜像，普通镜像包不依赖其他镜像。
+  installed="$(dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Depends}\n' 'linux-image-*' 2>/dev/null || true)"
+  while IFS=$'\t' read -r status package dependencies; do
+    [ "$status" = installed ] || continue
+    if [[ "$dependencies" =~ (^|[[:space:],\|])linux-image- ]]; then
+      if [[ "$package" =~ ^linux-image-[0-9]+\.[0-9]+-(.+)$ ]]; then
+        package="linux-image-${BASH_REMATCH[1]}"
+      fi
+      if [ -z "${kernel_package_seen[$package]:-}" ]; then
+        kernel_packages+=("$package")
+        kernel_package_seen["$package"]=1
+      fi
+    fi
+  done <<< "$installed"
+  if [ "${#kernel_packages[@]}" -eq 0 ]; then
+    # 部分精简镜像只安装了具体内核，按正在运行的 Debian 内核类型补装跟踪包。
+    case "$running_kernel" in
+      *-cloud-amd64) kernel_packages=(linux-image-cloud-amd64) ;;
+      *-rt-amd64) kernel_packages=(linux-image-rt-amd64) ;;
+      *-amd64) kernel_packages=(linux-image-amd64) ;;
+      *-cloud-arm64) kernel_packages=(linux-image-cloud-arm64) ;;
+      *-rt-arm64) kernel_packages=(linux-image-rt-arm64) ;;
+      *-arm64) kernel_packages=(linux-image-arm64) ;;
+      *-686-pae) kernel_packages=(linux-image-686-pae) ;;
+      *-686) kernel_packages=(linux-image-686) ;;
+      *-armmp-lpae) kernel_packages=(linux-image-armmp-lpae) ;;
+      *-armmp) kernel_packages=(linux-image-armmp) ;;
+      *-riscv64) kernel_packages=(linux-image-riscv64) ;;
+      *-s390x) kernel_packages=(linux-image-s390x) ;;
+      *-powerpc64le) kernel_packages=(linux-image-powerpc64le) ;;
+      *)
+        print_err "无法确定当前内核 ${running_kernel} 对应的 Debian 内核跟踪包，请按内核提供方的方式升级；可用 --disable kernel 跳过此模块。"
+        return 1
+        ;;
+    esac
+  fi
+  print_info "安装/更新内核跟踪包：${kernel_packages[*]}"
+  apt-get update || return 1
+  # 显式安装跟踪包以允许新增内核依赖，禁止为解决依赖冲突而移除现有软件包。
+  apt_install --no-remove "${kernel_packages[@]}" || return 1
+  KERNEL_UPDATE_COMPLETED=1
+  print_ok "内核安装/更新步骤完成；当前仍运行 ${running_kernel}，新内核需手动重启后生效。"
 }
 
 install_common_tools() {
@@ -1834,6 +1907,7 @@ print_execution_report() {
   local report_mode="${1:-run}"
   echo "主机名: $(hostname 2>/dev/null || true)"
   [ -f /etc/os-release ] && echo "系统版本: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
+  echo "当前运行的内核: $(uname -r)"
   if command -v timedatectl >/dev/null 2>&1; then
     echo "当前时间: $(timedatectl | grep 'Local time' | sed 's/^[[:space:]]*//' || true)"
     echo "当前时区: $(timedatectl | grep 'Time zone' | sed 's/^[[:space:]]*//' || true)"
@@ -1967,6 +2041,7 @@ print_dry_run() {
   local title enabled
   for title in \
     "1) 更新系统软件包" \
+    "1.5) 升级 Linux 内核（不自动重启）" \
     "2) 安装常用工具" \
     "2.5) 安装 NextTrace 和 mtr" \
     "3) 开启 BBR + fq" \
@@ -1979,6 +2054,7 @@ print_dry_run() {
     "8) 安装 Docker Engine 与 Docker Compose"; do
     case "$title" in
       "1)"*) enabled="$ENABLE_SYSTEM_UPDATE" ;;
+      "1.5)"*) enabled="$ENABLE_KERNEL_UPGRADE" ;;
       "2)"*) enabled="$ENABLE_COMMON_TOOLS" ;;
       "2.5)"*) enabled="$ENABLE_NEXTTRACE_MTR" ;;
       "3)"*) enabled="$ENABLE_BBR" ;;
@@ -2077,6 +2153,7 @@ validate_config
 print_config_summary
 
 run_step "1) 更新系统软件包" "$ENABLE_SYSTEM_UPDATE" update_system_packages
+run_step "1.5) 升级 Linux 内核（不自动重启）" "$ENABLE_KERNEL_UPGRADE" upgrade_linux_kernel
 run_step "2) 安装常用工具" "$ENABLE_COMMON_TOOLS" install_common_tools
 run_step "2.5) 安装 NextTrace 和 mtr" "$ENABLE_NEXTTRACE_MTR" install_nexttrace_mtr
 run_step "3) 开启 BBR + fq" "$ENABLE_BBR" configure_bbr_fq
