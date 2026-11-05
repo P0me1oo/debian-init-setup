@@ -70,6 +70,8 @@ class InitSetupTests(unittest.TestCase):
             ("/etc/", bash_path(self.root / "etc") + "/"),
             ("/root/.ssh", bash_path(self.root / "root" / ".ssh")),
             ("/run/sshd", bash_path(self.root / "run" / "sshd")),
+            ("/run/systemd/resolve/", bash_path(self.root / "run" / "systemd" / "resolve") + "/"),
+            ("/run/resolvconf/resolv.conf", bash_path(self.root / "run" / "resolvconf" / "resolv.conf")),
             ("/proc/", bash_path(self.root / "proc") + "/"),
             ("/boot/", bash_path(self.root / "boot") + "/"),
         ):
@@ -194,7 +196,8 @@ ip() {
             ("custom", {"ENABLE_SYSTEM_UPDATE": "no", "ENABLE_COMMON_TOOLS": "no", "ENABLE_NEXTTRACE_MTR": "no", "ENABLE_BBR": "no", "ENABLE_SSH_BASELINE": "no", "ENABLE_UFW": "no", "ENABLE_FAIL2BAN": "no", "ENABLE_JOURNAL_LIMIT": "no", "ENABLE_TIMEZONE": "no", "ENABLE_IPV6_DNS": "no", "ENABLE_DOCKER": "no"}),
         ):
             expected["ENABLE_KERNEL_UPGRADE"] = "no" if mode == "custom" else "yes"
-            result = self.run_script(f"INTERACTIVE_MODE=no\nMODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_IPV6_DNS $ENABLE_DOCKER $ENABLE_KERNEL_UPGRADE\"\n")
+            expected["ENABLE_DEFAULT_DNS"] = "no" if mode == "custom" else "yes"
+            result = self.run_script(f"INTERACTIVE_MODE=no\nMODE={mode}\napply_mode_defaults\nprintf '%s\\n' \"$ENABLE_SYSTEM_UPDATE $ENABLE_COMMON_TOOLS $ENABLE_NEXTTRACE_MTR $ENABLE_BBR $ENABLE_SSH_BASELINE $ENABLE_UFW $ENABLE_FAIL2BAN $ENABLE_JOURNAL_LIMIT $ENABLE_TIMEZONE $ENABLE_IPV6_DNS $ENABLE_DOCKER $ENABLE_KERNEL_UPGRADE $ENABLE_DEFAULT_DNS\"\n")
             self.assertIn(" ".join(expected.values()), result.stdout.splitlines())
 
     def test_removed_swap_and_htop_are_not_referenced(self):
@@ -216,19 +219,19 @@ ip() {
         return self.run_script(body, expected=expected)
 
     def test_interactive_custom_enter_keeps_all_modules_enabled(self):
-        result = self.run_custom_menu([""] * 12)
-        self.assertEqual(result.stdout.count(": 开启\n"), 12, result.stdout)
+        result = self.run_custom_menu([""] * 13)
+        self.assertEqual(result.stdout.count(": 开启\n"), 13, result.stdout)
         self.assertNotIn(": 关闭/跳过", result.stdout)
 
     def test_interactive_custom_no_disables_only_selected_module(self):
-        result = self.run_custom_menu([""] * 10 + ["n", ""])
-        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
+        result = self.run_custom_menu([""] * 11 + ["n", ""])
+        self.assertEqual(result.stdout.count(": 开启\n"), 12, result.stdout)
         self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 开启", result.stdout)
 
     def test_interactive_custom_enter_respects_explicit_disabled_modules(self):
-        result = self.run_custom_menu([""] * 12, "--disable", "ipv6,docker")
-        self.assertEqual(result.stdout.count(": 开启\n"), 10, result.stdout)
+        result = self.run_custom_menu([""] * 13, "--disable", "ipv6,docker")
+        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
         self.assertIn("移除 IPv6 DNS: 关闭/跳过", result.stdout)
         self.assertIn("Docker: 关闭/跳过", result.stdout)
 
@@ -352,9 +355,9 @@ apt-get() { record_call apt-get "$@"; }
                 self.assertTrue(line.endswith("开启" if enabled else "关闭/跳过"), result.stdout)
 
     def test_custom_menu_can_disable_only_kernel_upgrade(self):
-        result = self.run_custom_menu(["", "n"] + [""] * 10)
+        result = self.run_custom_menu(["", "n"] + [""] * 11)
         self.assertIn("Linux 内核升级（不自动重启）: 关闭/跳过", result.stdout)
-        self.assertEqual(result.stdout.count(": 开启\n"), 11, result.stdout)
+        self.assertEqual(result.stdout.count(": 开启\n"), 12, result.stdout)
 
     def test_kernel_upgrade_tracks_latest_series_and_preserves_flavors(self):
         packages = (
@@ -747,6 +750,257 @@ restore_ifupdown_ipv6
         self.assertIn("缺少有效前缀", result.stdout)
         self.assertNotIn("ip -6 address replace", self.calls())
         self.assertNotIn("ip -6 route replace", self.calls())
+
+    def test_default_dns_module_controls_and_dry_run(self):
+        for arguments, enabled in (
+            ([], True),
+            (["--disable", "dns"], False),
+            (["--no-dns"], False),
+            (["--mode", "custom"], False),
+            (["--disable", "all", "--enable", "default-dns"], True),
+            (["--no-dns", "--enable", "dns"], True),
+            (["--no-ipv6-dns"], True),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_script("", main_arguments=["--dry-run", *arguments])
+                line = next(line for line in result.stdout.splitlines() if "设置默认 DNS" in line)
+                self.assertTrue(line.endswith("开启" if enabled else "关闭/跳过"), result.stdout)
+                self.assertEqual(self.calls(), "")
+                self.assertFalse((self.root / "backups").exists())
+
+    def test_default_dns_environment_and_cli_precedence(self):
+        for arguments, enabled in (([], False), (["--enable", "dns"], True)):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(
+                    'ENV_MODULE_OVERRIDES[ENABLE_DEFAULT_DNS]=no\n',
+                    main_arguments=["--dry-run", "--mode", "full", *arguments],
+                )
+                line = next(line for line in result.stdout.splitlines() if "设置默认 DNS" in line)
+                self.assertTrue(line.endswith("开启" if enabled else "关闭/跳过"), result.stdout)
+
+    def test_custom_menu_can_disable_only_default_dns(self):
+        result = self.run_custom_menu([""] * 10 + ["n", "", ""])
+        self.assertIn("默认 DNS（8.8.8.8、1.1.1.1）: 关闭/跳过", result.stdout)
+        self.assertEqual(result.stdout.count(": 开启\n"), 12, result.stdout)
+
+    DEFAULT_DNS_ORIGINAL = (
+        "# 保留注释\nsearch example.com internal.example\n"
+        "nameserver 9.9.9.9\n  nameserver 2001:4860:4860::8888\n"
+        "nameserver 9.9.9.9\noptions timeout:2 rotate\n"
+    )
+    DEFAULT_DNS_EXPECTED = (
+        "# 保留注释\nsearch example.com internal.example\n"
+        "nameserver 8.8.8.8\nnameserver 1.1.1.1\noptions timeout:2 rotate\n"
+    )
+    DEFAULT_DNS_ENTRY_MOCK = r'''
+require_root() { :; }
+prepare_logfile() { :; }
+acquire_run_lock() { :; }
+check_runtime_environment() { :; }
+print_execution_report() { :; }
+'''
+
+    def test_default_dns_static_preserves_other_settings_and_first_backup(self):
+        resolver = self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        result = self.run_script("configure_default_dns\nconfigure_default_dns\nprintf 'changed=%s\\n' \"$DEFAULT_DNS_CHANGED_FILES\"\n")
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_EXPECTED)
+        self.assertIn("changed=0", result.stdout)
+        manifest = self.root / "backups" / "2026-01-01-000000-1" / "manifest"
+        self.assertEqual(len(manifest.read_text(encoding="utf-8").splitlines()), 1)
+        self.run_script("restore_latest_backup\n")
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+
+    def test_default_dns_creates_missing_resolver_and_restore_removes_it(self):
+        resolver = self.root / "etc/resolv.conf"
+        self.run_script("configure_default_dns\n")
+        self.assertEqual(resolver.read_text(encoding="utf-8"), "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+        self.run_script("restore_latest_backup\n")
+        self.assertFalse(resolver.exists())
+
+    def test_default_dns_dhclient_hook_survives_ipv4_and_ipv6_lease_updates(self):
+        resolver = self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        hook = self.root / "etc/dhcp/dhclient-enter-hooks.d/zz-init-setup-dns"
+        hook.parent.mkdir(parents=True)
+        result = self.run_script(r'''
+configure_default_dns
+new_domain_name_servers=9.9.9.9
+new_dhcp6_name_servers=2001:4860:4860::8888
+. "$TEST_ROOT/etc/dhcp/dhclient-enter-hooks.d/zz-init-setup-dns"
+printf 'v4=%s\nv6=%s\n' "$new_domain_name_servers" "$new_dhcp6_name_servers"
+''')
+        self.assertIn("v4=8.8.8.8 1.1.1.1\nv6=8.8.8.8 1.1.1.1", result.stdout)
+        self.run_script("restore_latest_backup\n")
+        self.assertFalse(hook.exists())
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+
+    def test_default_dns_backup_failure_stops_before_writing(self):
+        resolver = self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        self.run_script("backup_file() { return 1; }\nconfigure_default_dns\n", expected=1)
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+        self.assertFalse((self.root / "backups").exists())
+
+    RESOLVED_DEFAULT_DNS_MOCK = r'''
+systemctl() {
+  record_call systemctl "$@"
+  case "$*" in
+    'is-active --quiet systemd-resolved'|'try-restart systemd-resolved') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+resolvectl() { printf 'Global: 8.8.8.8 1.1.1.1\nLink 2 (eth0): 9.9.9.9\n'; }
+'''
+
+    def prepare_resolved_default_dns_fixture(self):
+        target = self.write_fixture(
+            "run/systemd/resolve/stub-resolv.conf", "nameserver 127.0.0.53\nsearch example.com\n",
+        )
+        resolver = self.root / "etc/resolv.conf"
+        resolver.symlink_to(target)
+        return resolver, target
+
+    @unittest.skipIf(os.name == "nt", "需要 Linux 符号链接")
+    def test_default_dns_resolved_preserves_symlink_and_network_settings(self):
+        resolver, target = self.prepare_resolved_default_dns_fixture()
+        network = self.write_fixture("etc/systemd/network/10-eth0.network", "[Network]\nDNS=9.9.9.9\nAddress=192.0.2.2/24\n")
+        originals = {path: path.read_bytes() for path in (target, network)}
+        self.run_script(self.RESOLVED_DEFAULT_DNS_MOCK + "\nconfigure_default_dns\n")
+        self.assertTrue(resolver.is_symlink())
+        for path, content in originals.items():
+            self.assertEqual(path.read_bytes(), content)
+        dropin = self.root / "etc/systemd/resolved.conf.d/99-init-setup-dns.conf"
+        self.assertEqual(dropin.read_text(encoding="utf-8"), "[Resolve]\nDNS=\nDNS=8.8.8.8 1.1.1.1\nFallbackDNS=\nDomains=~.\n")
+        self.assertIn("systemctl try-restart systemd-resolved", self.calls())
+        self.assertNotIn("networkctl", self.calls())
+        self.run_script(self.RESOLVED_DEFAULT_DNS_MOCK + "\nrestore_latest_backup\n")
+        self.assertFalse(dropin.exists())
+        self.assertTrue(resolver.is_symlink())
+
+    @unittest.skipIf(os.name == "nt", "需要 Linux 符号链接")
+    def test_default_dns_unrecognized_or_inactive_symlink_owner_stops(self):
+        resolver, target = self.prepare_resolved_default_dns_fixture()
+        original = target.read_bytes()
+        result = self.run_script("configure_default_dns\n", expected=1)
+        self.assertIn("无法识别", result.stdout)
+        self.assertTrue(resolver.is_symlink())
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse((self.root / "backups").exists())
+
+    @unittest.skipIf(os.name == "nt", "需要 Linux 符号链接")
+    def test_default_dns_failed_effective_configuration_rolls_back(self):
+        self.prepare_resolved_default_dns_fixture()
+        dropin = self.write_fixture("etc/systemd/resolved.conf.d/99-init-setup-dns.conf", "[Resolve]\nDNS=9.9.9.9\n")
+        original = dropin.read_bytes()
+        result = self.run_script(
+            self.RESOLVED_DEFAULT_DNS_MOCK + "\nresolvectl() { printf 'Global: 9.9.9.9\\n'; }\nconfigure_default_dns\n",
+            expected=1,
+        )
+        self.assertIn("配置校验失败", result.stdout)
+        self.assertIn("正在恢复修改前的配置", result.stdout)
+        self.assertEqual(dropin.read_bytes(), original)
+
+    @unittest.skipIf(os.name == "nt", "需要 Linux 符号链接")
+    def test_default_dns_refresh_failure_rolls_back_and_refreshes_again(self):
+        self.prepare_resolved_default_dns_fixture()
+        result = self.run_script(self.RESOLVED_DEFAULT_DNS_MOCK + r'''
+restarts=0
+systemctl() {
+  record_call systemctl "$@"
+  case "$*" in
+    'is-active --quiet systemd-resolved') return 0 ;;
+    'try-restart systemd-resolved') restarts=$((restarts + 1)); [ "$restarts" -gt 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+configure_default_dns
+''', expected=1)
+        self.assertIn("正在恢复修改前的配置", result.stdout)
+        self.assertEqual(self.calls().count("systemctl try-restart systemd-resolved"), 2)
+        self.assertFalse((self.root / "etc/systemd/resolved.conf.d/99-init-setup-dns.conf").exists())
+
+    NETWORKMANAGER_DEFAULT_DNS_MOCK = r'''
+systemctl() {
+  record_call systemctl "$@"
+  [ "$*" = 'is-active --quiet NetworkManager' ]
+}
+nmcli() {
+  record_call nmcli "$@"
+  if [ -f "$TEST_ROOT/etc/NetworkManager/conf.d/99-init-setup-dns.conf" ]; then
+    printf '# 保留注释\nsearch example.com internal.example\nnameserver 8.8.8.8\nnameserver 1.1.1.1\noptions timeout:2 rotate\n'
+  else
+    printf '# 保留注释\nsearch example.com internal.example\nnameserver 9.9.9.9\n  nameserver 2001:4860:4860::8888\nnameserver 9.9.9.9\noptions timeout:2 rotate\n'
+  fi > "$TEST_ROOT/etc/resolv.conf"
+}
+'''
+
+    def test_default_dns_networkmanager_configuration_reload_and_restore(self):
+        resolver = self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        self.run_script(self.NETWORKMANAGER_DEFAULT_DNS_MOCK + "\nconfigure_default_dns\nconfigure_default_dns\n")
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_EXPECTED)
+        dropin = self.root / "etc/NetworkManager/conf.d/99-init-setup-dns.conf"
+        self.assertEqual(
+            dropin.read_text(encoding="utf-8"),
+            "[global-dns]\nsearches=example.com,internal.example\noptions=timeout:2,rotate\n\n[global-dns-domain-*]\nservers=8.8.8.8,1.1.1.1\n",
+        )
+        self.assertIn("nmcli general reload conf dns-full", self.calls())
+        self.assertNotIn("connection down", self.calls())
+        self.run_script(self.NETWORKMANAGER_DEFAULT_DNS_MOCK + "\nrestore_latest_backup\n")
+        self.assertFalse(dropin.exists())
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+
+    def test_default_dns_networkmanager_local_cache_is_preserved(self):
+        resolver = self.write_fixture("etc/resolv.conf", "nameserver 127.0.0.1\n")
+        result = self.run_script(self.NETWORKMANAGER_DEFAULT_DNS_MOCK + "\nnmcli() { record_call nmcli \"$@\"; }\nconfigure_default_dns\n")
+        self.assertEqual(resolver.read_text(encoding="utf-8"), "nameserver 127.0.0.1\n")
+        self.assertIn("本地解析服务", result.stdout)
+
+    def test_default_dns_networkmanager_missing_cli_stops_before_changes(self):
+        resolver = self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        self.run_script(self.NETWORKMANAGER_DEFAULT_DNS_MOCK + r'''
+command() {
+  if [ "$*" = '-v nmcli' ]; then return 1; fi
+  builtin command "$@"
+}
+configure_default_dns
+''', expected=1)
+        self.assertEqual(resolver.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+        self.assertFalse((self.root / "backups").exists())
+
+    @unittest.skipIf(os.name == "nt", "需要 Linux 符号链接")
+    def test_default_dns_resolvconf_generated_file_and_restore(self):
+        target = self.write_fixture("run/resolvconf/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        resolver = self.root / "etc/resolv.conf"
+        resolver.symlink_to(target)
+        hook = self.root / "etc/resolvconf/update.d/zz-init-setup-dns"
+        hook.parent.mkdir(parents=True)
+        mock = r'''
+resolvconf() {
+  record_call resolvconf "$@"
+  printf '# 保留注释\nsearch example.com internal.example\nnameserver 9.9.9.9\n  nameserver 2001:4860:4860::8888\nnameserver 9.9.9.9\noptions timeout:2 rotate\n' > "$TEST_ROOT/run/resolvconf/resolv.conf"
+  if [ -x "$TEST_ROOT/etc/resolvconf/update.d/zz-init-setup-dns" ]; then
+    "$TEST_ROOT/etc/resolvconf/update.d/zz-init-setup-dns" || return 1
+  fi
+}
+'''
+        self.run_script(mock + "\nconfigure_default_dns\nresolvconf -u\nverify_default_dns resolvconf\n")
+        self.assertEqual(target.read_text(encoding="utf-8"), self.DEFAULT_DNS_EXPECTED)
+        self.assertTrue(resolver.is_symlink())
+        self.assertTrue(os.access(hook, os.X_OK))
+        self.run_script(mock + "\nrestore_latest_backup\n")
+        self.assertFalse(hook.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), self.DEFAULT_DNS_ORIGINAL)
+
+    def test_default_dns_runs_before_system_update_without_other_network_changes(self):
+        self.write_fixture("etc/resolv.conf", self.DEFAULT_DNS_ORIGINAL)
+        result = self.run_script(self.DEFAULT_DNS_ENTRY_MOCK + r'''
+update_system_packages() {
+  verify_default_dns static || return 1
+  record_call update_system_packages
+}
+''', main_arguments=["--yes", "--mode", "custom", "--enable", "dns,update"])
+        self.assertLess(result.stdout.index("0.8) 设置默认 DNS"), result.stdout.index("1) 更新系统软件包"))
+        self.assertIn("update_system_packages", self.calls())
+        for forbidden in ("ip ", "sysctl ", "update-grub", "ufw ", "apt_install "):
+            self.assertNotIn(forbidden, self.calls())
 
     def prepare_dns_fixture(self):
         self.resolv_conf = self.write_fixture(

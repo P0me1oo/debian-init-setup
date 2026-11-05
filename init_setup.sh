@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Debian 初始化脚本
 # 支持推荐、精简、完整和自定义模式；无人值守运行必须显式使用 --yes。
 
-SCRIPT_VERSION="4.1.0"
+SCRIPT_VERSION="4.2.0"
 SCRIPT_AUTHOR="P0me1oo"
 LOGFILE="${LOGFILE:-/var/log/debian_init_setup.log}"
 LOCKFILE="${LOCKFILE:-/run/debian-init-setup.lock}"
@@ -27,6 +27,7 @@ SSH_SERVICE_RELOADED=0
 IPV6_REBOOT_REQUIRED=0
 KERNEL_UPDATE_COMPLETED=0
 IPV6_DNS_CHANGED_FILES=0
+DEFAULT_DNS_CHANGED_FILES=0
 INTERACTIVE_MODE="${INTERACTIVE_MODE:-auto}"
 ORIGINAL_STDIN_IS_TTY=0
 ORIGINAL_STDOUT_IS_TTY=0
@@ -39,7 +40,7 @@ ENABLE_IPV6_DNS="${ENABLE_IPV6_DNS:-${ENABLE_DISABLE_IPV6:-}}"
 declare -a MODULE_TOGGLE_NAMES=(
   ENABLE_SYSTEM_UPDATE ENABLE_KERNEL_UPGRADE ENABLE_COMMON_TOOLS ENABLE_NEXTTRACE_MTR ENABLE_IPV6_DNS
   ENABLE_BBR ENABLE_SSH_BASELINE ENABLE_UFW ENABLE_FAIL2BAN ENABLE_JOURNAL_LIMIT
-  ENABLE_TIMEZONE ENABLE_DOCKER
+  ENABLE_TIMEZONE ENABLE_DEFAULT_DNS ENABLE_DOCKER
 )
 declare -A ENV_MODULE_OVERRIDES=()
 for module_var in "${MODULE_TOGGLE_NAMES[@]}"; do
@@ -59,6 +60,7 @@ ENABLE_UFW="${ENABLE_UFW:-yes}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-yes}"
 ENABLE_JOURNAL_LIMIT="${ENABLE_JOURNAL_LIMIT:-yes}"
 ENABLE_TIMEZONE="${ENABLE_TIMEZONE:-yes}"
+ENABLE_DEFAULT_DNS="${ENABLE_DEFAULT_DNS:-yes}"
 ENABLE_DOCKER="${ENABLE_DOCKER:-yes}"
 ENABLE_NEXTTRACE_MTR="${ENABLE_NEXTTRACE_MTR:-yes}"
 JOURNAL_MAX_USE="${JOURNAL_MAX_USE:-50M}"
@@ -79,6 +81,7 @@ declare -a SELECTED_STEPS=()
 declare -a SKIPPED_STEPS=()
 declare -a UFW_ALLOWED_SSH_PORTS=()
 declare -a SSH_TRANSACTION_FILES=()
+declare -a DEFAULT_DNS_TRANSACTION_FILES=()
 declare -a CLI_TOGGLE_VALUES=()
 declare -a CLI_TOGGLE_LISTS=()
 declare -A BACKED_UP_FILES=()
@@ -111,8 +114,9 @@ usage() {
 自定义交互默认开启各模块：[Y/n] 回车开启，输入 n 关闭。
 
 模块名:
-  update, kernel, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, ipv6-dns, docker, all
+  update, kernel, tools, nexttrace-mtr, bbr, ssh, ufw, fail2ban, journald, timezone, dns, ipv6-dns, docker, all
   kernel 升级到当前软件源提供的最新 Linux 内核，不自动重启；新内核需用户手动重启后生效。
+  dns 将默认 DNS 设置为 8.8.8.8 和 1.1.1.1，在系统更新前执行。
   ipv6-dns 只移除 IPv6 DNS，保留 IPv6 联网能力；兼容旧模块名 ipv6。
 
 选项:
@@ -136,7 +140,8 @@ usage() {
       --replace-existing-runtime  允许 Docker 模块替换已有容器运行时
       --no-journal-limit           不配置 systemd journal 大小限制
       --no-nexttrace-mtr           不安装 NextTrace 和 mtr
-      --no-ipv6-dns                不修改 DNS 配置
+      --no-dns                     不设置默认 DNS
+      --no-ipv6-dns                不移除 IPv6 DNS
   -h, --help                       显示帮助
   -V, --version                    显示版本
 
@@ -145,6 +150,7 @@ usage() {
   bash init_setup.sh --mode recommended
   bash init_setup.sh --yes --mode minimal
   bash init_setup.sh --yes --mode full
+  bash init_setup.sh --yes --mode custom --enable dns
   bash init_setup.sh --yes --mode custom --enable ipv6-dns
   bash init_setup.sh --check
   bash init_setup.sh --yes --restore-ipv6-dns
@@ -218,6 +224,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=yes
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
+      ENABLE_DEFAULT_DNS=yes
       ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       ;;
@@ -232,6 +239,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=no
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
+      ENABLE_DEFAULT_DNS=yes
       ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       ;;
@@ -246,6 +254,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=yes
       ENABLE_JOURNAL_LIMIT=yes
       ENABLE_TIMEZONE=yes
+      ENABLE_DEFAULT_DNS=yes
       ENABLE_IPV6_DNS=yes
       ENABLE_DOCKER=yes
       ;;
@@ -260,6 +269,7 @@ apply_mode_defaults() {
       ENABLE_FAIL2BAN=no
       ENABLE_JOURNAL_LIMIT=no
       ENABLE_TIMEZONE=no
+      ENABLE_DEFAULT_DNS=no
       ENABLE_IPV6_DNS=no
       ENABLE_DOCKER=no
       if should_prompt; then
@@ -275,7 +285,10 @@ set_toggle_by_name() {
   name="${name//_/-}"
   case "$name" in
     all)
-      ENABLE_SYSTEM_UPDATE="$value"; ENABLE_KERNEL_UPGRADE="$value"; ENABLE_COMMON_TOOLS="$value"; ENABLE_NEXTTRACE_MTR="$value"; ENABLE_IPV6_DNS="$value"; ENABLE_BBR="$value"; ENABLE_SSH_BASELINE="$value"; ENABLE_UFW="$value"; ENABLE_FAIL2BAN="$value"; ENABLE_JOURNAL_LIMIT="$value"; ENABLE_TIMEZONE="$value"; ENABLE_DOCKER="$value" ;;
+      local module_var
+      for module_var in "${MODULE_TOGGLE_NAMES[@]}"; do
+        printf -v "$module_var" '%s' "$value"
+      done ;;
     update|upgrade|system-update) ENABLE_SYSTEM_UPDATE="$value" ;;
     kernel|kernel-upgrade|linux-kernel) ENABLE_KERNEL_UPGRADE="$value" ;;
     tools|common-tools) ENABLE_COMMON_TOOLS="$value" ;;
@@ -287,6 +300,7 @@ set_toggle_by_name() {
     fail2ban|f2b) ENABLE_FAIL2BAN="$value" ;;
     journald|journal|journal-limit|log-limit|systemd-journal) ENABLE_JOURNAL_LIMIT="$value" ;;
     timezone|tz|time-zone) ENABLE_TIMEZONE="$value" ;;
+    dns|default-dns) ENABLE_DEFAULT_DNS="$value" ;;
     docker) ENABLE_DOCKER="$value" ;;
     "") ;;
     *) print_err "未知模块名: $2。使用 --help 查看可用模块。"; exit 2 ;;
@@ -328,6 +342,7 @@ parse_args() {
       --no-tools) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(tools); shift ;;
       --no-nexttrace-mtr|--no-trace-tools|--no-net-trace) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(nexttrace-mtr); shift ;;
       --no-ipv6-dns|--no-ipv6|--no-disable-ipv6) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ipv6-dns); shift ;;
+      --no-dns) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(dns); shift ;;
       --no-bbr) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(bbr); shift ;;
       --no-ssh) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ssh); shift ;;
       --no-ufw|--no-firewall) CLI_TOGGLE_VALUES+=(no); CLI_TOGGLE_LISTS+=(ufw); shift ;;
@@ -500,6 +515,7 @@ prompt_configuration() {
   prompt_yes_no ENABLE_FAIL2BAN "启用 Fail2ban" || return 1
   prompt_yes_no ENABLE_JOURNAL_LIMIT "限制 systemd journal 最大占用为 ${JOURNAL_MAX_USE}" || return 1
   prompt_yes_no ENABLE_TIMEZONE "设置系统时区为 ${TARGET_TIMEZONE}，并安装启用 chrony 做时间同步" || return 1
+  prompt_yes_no ENABLE_DEFAULT_DNS "设置默认 DNS 为 8.8.8.8 和 1.1.1.1" || return 1
   prompt_yes_no ENABLE_IPV6_DNS "移除 IPv6 DNS" || return 1
   prompt_yes_no ENABLE_DOCKER "安装 Docker Engine 与 Docker Compose" || return 1
 }
@@ -509,10 +525,10 @@ prompt_mode_selection() {
   [ "$MODE_EXPLICIT" -eq 1 ] && return 0
   print_section "0) 选择运行模式"
   echo "1) 推荐模式"
-  echo "   默认启用：系统更新、内核升级、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制和时间同步"
+  echo "   默认启用：系统更新、内核升级、常用工具、NextTrace 和 mtr、BBR + fq、SSH、防火墙、Fail2ban、日志限制、时间同步和默认 DNS"
   echo "   默认跳过：移除 IPv6 DNS、安装 Docker"
   echo "2) 精简模式"
-  echo "   默认启用：系统更新、内核升级、BBR + fq、SSH、防火墙、日志限制和时间同步"
+  echo "   默认启用：系统更新、内核升级、BBR + fq、SSH、防火墙、日志限制、时间同步和默认 DNS"
   echo "   默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker"
   echo "3) 完整模式"
   echo "   默认启用：全部模块"
@@ -549,6 +565,7 @@ print_config_summary() {
   printf 'Fail2ban: %s\n' "$(state_text "$ENABLE_FAIL2BAN")"
   printf 'systemd journal 大小限制: %s\n' "$(state_text "$ENABLE_JOURNAL_LIMIT")"
   printf '系统时区 + chrony 时间同步: %s\n' "$(state_text "$ENABLE_TIMEZONE")"
+  printf '默认 DNS（8.8.8.8、1.1.1.1）: %s\n' "$(state_text "$ENABLE_DEFAULT_DNS")"
   printf '移除 IPv6 DNS: %s\n' "$(state_text "$ENABLE_IPV6_DNS")"
   printf 'Docker: %s\n' "$(state_text "$ENABLE_DOCKER")"
   printf '运行模式: %s\n' "$MODE"
@@ -733,6 +750,9 @@ restore_latest_backup() {
     print_err "备份恢复未完全成功，请检查：${backup_dir}"
     return 1
   fi
+  if [ -f "${backup_dir}/default-dns-backend" ]; then
+    refresh_default_dns "$(<"${backup_dir}/default-dns-backend")" || return 1
+  fi
   if command -v sysctl >/dev/null 2>&1; then
     sysctl --system >/dev/null 2>&1 || true
   fi
@@ -898,6 +918,220 @@ grub_config_has_ipv6_disable_arg() {
   awk '/^[[:space:]]*GRUB_CMDLINE_LINUX(_DEFAULT)?=/ &&
        /ipv6[.]disable=1([[:space:]"\047]|$)/ { found=1 }
        END { exit !found }' "$file"
+}
+
+# 保留 search、options 和独立注释，只替换生效的 nameserver 行。
+# shellcheck disable=SC2016
+DEFAULT_DNS_NAMESERVERS_AWK='
+function emit_servers() {
+  print "nameserver 8.8.8.8"
+  print "nameserver 1.1.1.1"
+  emitted = 1
+}
+$1 == "nameserver" { if (!emitted) emit_servers(); next }
+{ print }
+END { if (!emitted) emit_servers() }
+'
+
+detect_default_dns_backend() {
+  local resolver_target=""
+  DEFAULT_DNS_BACKEND=static
+  if [ -L /etc/resolv.conf ]; then
+    resolver_target="$(readlink -f /etc/resolv.conf)" || return 1
+  fi
+  if systemctl is-active --quiet NetworkManager; then
+    if ! command -v nmcli >/dev/null 2>&1; then
+      print_err "NetworkManager 正在管理网络，但缺少 nmcli，未修改 DNS。"
+      return 1
+    fi
+    DEFAULT_DNS_BACKEND=networkmanager
+    return 0
+  fi
+  if systemctl is-active --quiet systemd-resolved; then
+    case "$resolver_target" in
+      /run/systemd/resolve/*) DEFAULT_DNS_BACKEND=resolved ;;
+    esac
+    if [ -r /etc/resolv.conf ] && awk '$1 == "nameserver" && $2 ~ /^127[.]0[.]0[.](53|54)$/ { found=1 } END { exit !found }' /etc/resolv.conf; then
+      DEFAULT_DNS_BACKEND=resolved
+    fi
+    if [ "$DEFAULT_DNS_BACKEND" = resolved ]; then
+      if ! command -v resolvectl >/dev/null 2>&1; then
+        print_err "缺少 resolvectl，无法校验 systemd-resolved 的上游 DNS，未修改配置。"
+        return 1
+      fi
+      return 0
+    fi
+  fi
+  if command -v resolvconf >/dev/null 2>&1; then
+    if [ -d /etc/resolvconf/update.d ]; then
+      case "$resolver_target" in
+        ""|/run/resolvconf/resolv.conf)
+          DEFAULT_DNS_BACKEND=resolvconf
+          return 0 ;;
+      esac
+    fi
+  fi
+  if [ -L /etc/resolv.conf ]; then
+    print_err "无法识别 /etc/resolv.conf 的生成服务（${resolver_target}），未修改 DNS。"
+    return 1
+  fi
+}
+
+apply_default_dns_file() {
+  local file="$1" prepared="$2" backend="$3" mode="${4:-}" parent
+  if [ -L "$file" ]; then
+    print_err "DNS 配置文件是符号链接，未直接覆盖：${file}"
+    return 1
+  fi
+  if [ -f "$file" ] && cmp -s "$file" "$prepared" && { [ "$mode" != 0755 ] || [ -x "$file" ]; }; then
+    return 0
+  fi
+  backup_file "$file" || return 1
+  printf '%s\n' "$backend" > "${BACKUP_DIR}/default-dns-backend" || return 1
+  chmod 0600 "${BACKUP_DIR}/default-dns-backend" || return 1
+  DEFAULT_DNS_TRANSACTION_FILES+=("$file")
+  parent="$(dirname "$file")"
+  if [ ! -d "$parent" ]; then install -d -m 0755 "$parent" || return 1; fi
+  if [ ! -e "$file" ] && [ -z "$mode" ]; then mode=0644; fi
+  cat "$prepared" > "$file" || return 1
+  [ -z "$mode" ] || chmod "$mode" "$file" || return 1
+  DEFAULT_DNS_CHANGED_FILES=$((DEFAULT_DNS_CHANGED_FILES + 1))
+  print_info "${file}：已设置默认 DNS。"
+}
+
+write_default_dns_configuration() {
+  local backend="$1" work_dir="$2" searches="" options=""
+  case "$backend" in
+    resolved)
+      cat > "$work_dir/config" <<'RESOLVED_DNS' || return 1
+[Resolve]
+DNS=
+DNS=8.8.8.8 1.1.1.1
+FallbackDNS=
+Domains=~.
+RESOLVED_DNS
+      apply_default_dns_file /etc/systemd/resolved.conf.d/99-init-setup-dns.conf "$work_dir/config" "$backend" 0644 || return 1
+      ;;
+    networkmanager)
+      if [ -r /etc/resolv.conf ]; then
+        searches="$(awk '$1 == "search" || $1 == "domain" { for (i=2; i<=NF; i++) { if ($i ~ /^[#;]/) break; printf "%s,", $i } }' /etc/resolv.conf)" || return 1
+        options="$(awk '$1 == "options" { for (i=2; i<=NF; i++) { if ($i ~ /^[#;]/) break; printf "%s,", $i } }' /etc/resolv.conf)" || return 1
+      fi
+      cat > "$work_dir/config" <<NETWORKMANAGER_DNS || return 1
+[global-dns]
+searches=${searches%,}
+options=${options%,}
+
+[global-dns-domain-*]
+servers=8.8.8.8,1.1.1.1
+NETWORKMANAGER_DNS
+      apply_default_dns_file /etc/NetworkManager/conf.d/99-init-setup-dns.conf "$work_dir/config" "$backend" 0644 || return 1
+      ;;
+    resolvconf)
+      # Debian resolvconf 每次生成解析文件后再固定 nameserver，保留其他生成内容。
+      cat > "$work_dir/hook" <<'RESOLVCONF_DNS_START' || return 1
+#!/bin/sh
+set -eu
+resolver_file=/etc/resolv.conf
+[ -f "$resolver_file" ] || exit 0
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/debian-init-dns.XXXXXX")"
+trap 'rm -rf -- "$work_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+awk '
+RESOLVCONF_DNS_START
+      printf '%s\n' "$DEFAULT_DNS_NAMESERVERS_AWK" >> "$work_dir/hook" || return 1
+      cat >> "$work_dir/hook" <<'RESOLVCONF_DNS_END' || return 1
+' "$resolver_file" > "$work_dir/resolv.conf"
+cat "$work_dir/resolv.conf" > "$resolver_file"
+RESOLVCONF_DNS_END
+      apply_default_dns_file /etc/resolvconf/update.d/zz-init-setup-dns "$work_dir/hook" "$backend" 0755 || return 1
+      ;;
+    static)
+      if [ -e /etc/resolv.conf ]; then
+        awk "$DEFAULT_DNS_NAMESERVERS_AWK" /etc/resolv.conf > "$work_dir/config" || return 1
+      else
+        awk "$DEFAULT_DNS_NAMESERVERS_AWK" /dev/null > "$work_dir/config" || return 1
+      fi
+      apply_default_dns_file /etc/resolv.conf "$work_dir/config" "$backend" || return 1
+      ;;
+    *) print_err "未知 DNS 配置方式：${backend}"; return 1 ;;
+  esac
+  if { [ "$backend" = static ] || [ "$backend" = resolvconf ]; } && [ -d /etc/dhcp/dhclient-enter-hooks.d ]; then
+    cat > "$work_dir/dhcp-hook" <<'DHCLIENT_DNS' || return 1
+# Debian 初始化：在 DHCP 续租时保留默认 DNS。
+new_domain_name_servers="8.8.8.8 1.1.1.1"
+new_dhcp6_name_servers="8.8.8.8 1.1.1.1"
+DHCLIENT_DNS
+    apply_default_dns_file /etc/dhcp/dhclient-enter-hooks.d/zz-init-setup-dns "$work_dir/dhcp-hook" "$backend" 0644 || return 1
+  fi
+}
+
+refresh_default_dns() {
+  case "$1" in
+    static) return 0 ;;
+    resolved) systemctl try-restart systemd-resolved || return 1 ;;
+    networkmanager) nmcli general reload conf dns-full || return 1 ;;
+    resolvconf) resolvconf -u || return 1 ;;
+    *) print_err "未知 DNS 配置方式：$1"; return 1 ;;
+  esac
+}
+
+verify_default_dns() {
+  local backend="$1" servers
+  if [ "$backend" = resolved ]; then
+    servers="$(LC_ALL=C resolvectl dns)" || return 1
+    servers="$(printf '%s\n' "$servers" | awk '$1 == "Global:" { for (i=2; i<=NF; i++) printf "%s%s", (i == 2 ? "" : " "), $i }')" || return 1
+  else
+    [ -r /etc/resolv.conf ] || { print_err "无法读取生成后的 /etc/resolv.conf。"; return 1; }
+    servers="$(awk '$1 == "nameserver" { printf "%s%s", (found++ ? " " : ""), $2 }' /etc/resolv.conf)" || return 1
+    if [ "$backend" = networkmanager ] && printf '%s\n' "$servers" | awk '
+      { for (i=1; i<=NF; i++) if ($i !~ /^127[.]/ && $i != "::1") exit 1 }
+      END { if (NF == 0) exit 1 }
+    '; then
+      print_info "NetworkManager 已刷新默认 DNS；/etc/resolv.conf 使用其本地解析服务。"
+      return 0
+    fi
+  fi
+  if [ "$servers" != "8.8.8.8 1.1.1.1" ]; then
+    print_err "默认 DNS 配置校验失败，当前服务器列表：${servers:-空}"
+    return 1
+  fi
+  print_ok "默认 DNS 配置校验通过：8.8.8.8、1.1.1.1。"
+}
+
+rollback_default_dns() {
+  local backend="$1" index failed=0
+  [ "${#DEFAULT_DNS_TRANSACTION_FILES[@]}" -gt 0 ] || return 0
+  print_warn "默认 DNS 设置失败，正在恢复修改前的配置。"
+  for ((index=${#DEFAULT_DNS_TRANSACTION_FILES[@]}-1; index>=0; index--)); do
+    if ! restore_file_from_backup "$BACKUP_DIR" "${DEFAULT_DNS_TRANSACTION_FILES[$index]}"; then
+      print_err "DNS 配置恢复失败：${DEFAULT_DNS_TRANSACTION_FILES[$index]}"
+      failed=1
+    fi
+  done
+  refresh_default_dns "$backend" || failed=1
+  DEFAULT_DNS_CHANGED_FILES=0
+  if [ "$failed" -ne 0 ]; then
+    print_err "DNS 原配置未完整恢复，请检查备份：${BACKUP_DIR}"
+    return 1
+  fi
+}
+
+configure_default_dns() {
+  local work_dir
+  DEFAULT_DNS_CHANGED_FILES=0
+  DEFAULT_DNS_TRANSACTION_FILES=()
+  detect_default_dns_backend || return 1
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/debian-init-dns.XXXXXX")" || return 1
+  if ! write_default_dns_configuration "$DEFAULT_DNS_BACKEND" "$work_dir" ||
+     ! refresh_default_dns "$DEFAULT_DNS_BACKEND" ||
+     ! verify_default_dns "$DEFAULT_DNS_BACKEND"; then
+    rollback_default_dns "$DEFAULT_DNS_BACKEND" || true
+    rm -rf -- "$work_dir"
+    return 1
+  fi
+  rm -rf -- "$work_dir"
+  print_ok "默认 DNS 已设置为 8.8.8.8 和 1.1.1.1。"
 }
 
 # 只处理 DNS 服务器地址：nameserver 行、systemd 的 DNS=/FallbackDNS= 和 ifupdown 的 dns-nameservers。
@@ -2040,6 +2274,7 @@ print_dry_run() {
   printf '运行模式: %s\n' "$MODE"
   local title enabled
   for title in \
+    "0.8) 设置默认 DNS 为 8.8.8.8 和 1.1.1.1" \
     "1) 更新系统软件包" \
     "1.5) 升级 Linux 内核（不自动重启）" \
     "2) 安装常用工具" \
@@ -2053,6 +2288,7 @@ print_dry_run() {
     "7.4) 移除 IPv6 DNS" \
     "8) 安装 Docker Engine 与 Docker Compose"; do
     case "$title" in
+      "0.8)"*) enabled="$ENABLE_DEFAULT_DNS" ;;
       "1)"*) enabled="$ENABLE_SYSTEM_UPDATE" ;;
       "1.5)"*) enabled="$ENABLE_KERNEL_UPGRADE" ;;
       "2)"*) enabled="$ENABLE_COMMON_TOOLS" ;;
@@ -2152,6 +2388,7 @@ normalize_all_booleans
 validate_config
 print_config_summary
 
+run_step "0.8) 设置默认 DNS 为 8.8.8.8 和 1.1.1.1" "$ENABLE_DEFAULT_DNS" configure_default_dns
 run_step "1) 更新系统软件包" "$ENABLE_SYSTEM_UPDATE" update_system_packages
 run_step "1.5) 升级 Linux 内核（不自动重启）" "$ENABLE_KERNEL_UPGRADE" upgrade_linux_kernel
 run_step "2) 安装常用工具" "$ENABLE_COMMON_TOOLS" install_common_tools

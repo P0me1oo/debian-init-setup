@@ -2,7 +2,7 @@
 
 面向 Debian 服务器的模块化初始化脚本，支持推荐、精简、完整和自定义模式。
 
-- 当前版本：`4.1.0`
+- 当前版本：`4.2.0`
 - 主脚本：`init_setup.sh`
 - 版本记录：[CHANGELOG.md](CHANGELOG.md)
 
@@ -20,10 +20,37 @@
 | `fail2ban` | 安装并启用 Fail2ban，保护 SSH |
 | `journald` | 限制 systemd journal 日志大小 |
 | `timezone` | 设置时区并安装启用 chrony |
+| `dns` | 自动将默认 DNS 设置为 `8.8.8.8` 和 `1.1.1.1`，在系统更新前执行 |
 | `ipv6-dns` | 只移除 DNS 配置中的 IPv6 nameserver，保留 IPv6 联网能力；兼容旧模块名 `ipv6` |
 | `docker` | 安装 Docker Engine、Buildx 和 Compose 插件 |
 
 脚本不负责配置 ZRAM、swapfile 或 htop。
+
+## 自动设置默认 DNS
+
+推荐、精简和完整模式默认开启 `dns` 模块；交互式自定义模式也默认开启。将默认 DNS 设置为 `8.8.8.8` 和 `1.1.1.1`，在更新软件包前执行。单独设置 DNS，以 root 身份运行：
+
+```bash
+bash init_setup.sh --yes --mode custom --enable dns
+```
+
+跳过此功能可使用 `--disable dns`、`--no-dns` 或环境变量 `ENABLE_DEFAULT_DNS=no`。原有 `ipv6-dns` 模块仍可独立控制；`--no-ipv6-dns` 只跳过移除 IPv6 DNS，不关闭默认 DNS 设置。需要保留现有 DNS 时使用 `--disable dns,ipv6-dns`。
+
+脚本按当前解析服务选择配置方式：
+
+| 配置方式 | 处理方式 |
+| --- | --- |
+| 普通 `/etc/resolv.conf` | 只替换 `nameserver`，保留 `search`、`options` 和独立注释；文件不存在时创建 |
+| systemd-resolved | 写入 `/etc/systemd/resolved.conf.d/99-init-setup-dns.conf`，设置全局 DNS 和默认查询路由 `~.`，刷新服务并校验全局上游；保留生成文件的符号链接 |
+| NetworkManager | 写入 `/etc/NetworkManager/conf.d/99-init-setup-dns.conf`，设置全局默认域的 DNS，保留当前解析文件的搜索域和选项，通过 `nmcli` 重新载入配置及 DNS 插件 |
+| Debian resolvconf | 写入 `/etc/resolvconf/update.d/zz-init-setup-dns` 钩子，每次生成解析文件后固定两个 `nameserver`，立即执行 `resolvconf -u`；保留符号链接 |
+| dhclient | 普通解析文件或 resolvconf 模式下，若已有 DHCP 钩子目录，写入续租钩子，避免 DHCP 重新下发原 DNS |
+
+修改前备份；重复执行不重复添加地址或覆盖本次运行的原始备份。写入、刷新或校验失败时尝试恢复修改前的配置，并返回非零退出码。执行 `--restore` 会恢复最近一次备份并刷新对应解析服务；它会同时恢复该次运行备份的其他配置。`--restore-ipv6-dns` 只撤销原有 IPv6 DNS 清理，不撤销此模块。
+
+此模块不修改网卡地址、路由、IPv6 开关或防火墙，不重启网络连接。systemd-resolved 的更具体域名路由仍遵循原配置。NetworkManager 使用本地缓存解析器时，脚本确认配置重新载入成功，保留本地解析地址；此分支不直接验证缓存解析器的上游。配置校验不代表已验证公共 DNS 的外网连通性。
+
+无法识别解析文件符号链接的生成服务、对应服务未运行或缺少管理命令时停止修改。resolvconf 适配针对 Debian 的 `update.d` 接口；其他实现以及 cloud-init 或自定义脚本在启动时覆盖解析文件的场景，需要在其配置中同步设置 DNS。
 
 ## Linux 内核升级
 
@@ -116,7 +143,7 @@ curl -fsSL https://raw.githubusercontent.com/P0me1oo/debian-init-setup/main/init
 
 ```text
 update, kernel, tools, nexttrace-mtr, bbr, ssh, ufw,
-fail2ban, journald, timezone
+fail2ban, journald, timezone, dns
 ```
 
 默认跳过：移除 IPv6 DNS、安装 Docker。
@@ -130,7 +157,7 @@ bash init_setup.sh --yes --mode recommended
 默认启用：
 
 ```text
-update, kernel, bbr, ssh, ufw, journald, timezone
+update, kernel, bbr, ssh, ufw, journald, timezone, dns
 ```
 
 默认跳过：安装常用工具、安装 NextTrace 和 mtr、启用 Fail2ban、移除 IPv6 DNS、安装 Docker。
@@ -172,10 +199,10 @@ bash init_setup.sh --yes --mode custom --enable update,kernel,bbr,ssh,ufw,journa
 可用模块名：
 
 ```text
-update kernel tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone ipv6-dns docker all
+update kernel tools nexttrace-mtr bbr ssh ufw fail2ban journald timezone dns ipv6-dns docker all
 ```
 
-旧模块名 `ipv6`、`disable-ipv6` 现在也只执行 DNS 修改。新环境变量为 `ENABLE_IPV6_DNS`，兼容旧变量 `ENABLE_DISABLE_IPV6`；两者同时设置时使用新变量。`--no-ipv6-dns` 和旧参数 `--no-ipv6`、`--no-disable-ipv6` 均跳过 DNS 修改。
+旧模块名 `ipv6`、`disable-ipv6` 现在也只移除 IPv6 DNS。环境变量为 `ENABLE_IPV6_DNS`，兼容旧变量 `ENABLE_DISABLE_IPV6`；两者同时设置时使用新变量。`--no-ipv6-dns` 和旧参数 `--no-ipv6`、`--no-disable-ipv6` 均跳过 IPv6 DNS 清理，默认 DNS 模块由 `dns` 开关独立控制。
 
 模块配置依次应用模式默认值、环境变量和命令行开关，后者覆盖前者。多个 `--enable`、`--disable` 按出现顺序处理；命令行开关也会覆盖自定义菜单的选择。例如：
 
@@ -300,3 +327,5 @@ python -m unittest discover -s tests -v
 `3.2.0` 的 DNS 处理目前只通过上述回归测试验证，未在实机上验证 `resolvconf -u`、`networkctl reload` 和 `systemd-resolved` 重启后的重新生成结果。
 
 `4.0.0` 补充 DNS 单独执行和恢复、IPv6 网络配置保持原样、IPv4 DNS 检查、恢复冲突和刷新失败重试等隔离测试。此版本尚未在 Debian 实机上验证。
+
+`4.2.0` 补充默认 DNS 的模块开关、菜单、执行顺序、普通解析文件及 DHCP 续租、systemd-resolved、NetworkManager、Debian resolvconf 的生成钩子、重复执行、备份恢复和失败回滚测试。服务命令使用模拟实现，尚未在实机上修改 DNS 或验证服务重载后的外网解析。
